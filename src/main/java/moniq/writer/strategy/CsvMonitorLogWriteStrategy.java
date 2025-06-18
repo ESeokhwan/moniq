@@ -1,6 +1,6 @@
-package moniq.writer;
+package moniq.writer.strategy;
 
-import moniq.MonitorLog;
+import moniq.IMonitorLog;
 
 import java.io.BufferedWriter;
 import java.io.FileWriter;
@@ -17,26 +17,22 @@ public class CsvMonitorLogWriteStrategy implements IMonitorLogWriteStrategy {
   }
 
   @Override
-  public void write(MonitorLog log) {
+  public void write(IMonitorLog log) {
     if (writer == null) {
       try {
         this.writer = new BufferedWriter(new FileWriter(filepath));
-        writer.append("RequestType,MessageId,Timestamp,TimestampNano,state\n");
+        String headerLine = String.join(",", log.getHeaders());
+        writer.append(headerLine)
+              .append("\n");
       } catch (IOException e) {
         e.printStackTrace();
       }
     }
     
     try {
-      writer.append(log.getType())
-          .append(",")
-          .append(log.getId())
-          .append(",")
-          .append(String.valueOf(log.getTimestamp()))
-          .append(",")
-          .append(String.valueOf(log.getTimestampNano()))
-          .append(log.getState())
-          .append("\n");
+      String curLine = String.join(",", log.getValues());
+      writer.append(curLine)
+            .append("\n");
     } catch (IOException e) {
       e.printStackTrace();
     }

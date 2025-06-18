@@ -1,8 +1,9 @@
 package moniq;
 
+import java.util.List;
 import java.util.Objects;
 
-public class MonitorLog {
+public class MonitorLog implements IMonitorLog {
 
   private final String type;
 
@@ -66,5 +67,15 @@ public class MonitorLog {
             ", timestamp=" + timestamp +
             ", timestampNano=" + timestampNano +
             '}';
+  }
+
+  @Override
+  public List<String> getHeaders() {
+    return List.of("RequestType", "Id", "Timestamp", "TimestampNano", "State");
+  }
+
+  @Override
+  public List<String> getValues() {
+    return List.of(type, id, String.valueOf(timestamp), String.valueOf(timestampNano), state);
   }
 }

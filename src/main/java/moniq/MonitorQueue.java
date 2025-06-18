@@ -6,22 +6,22 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class MonitorQueue {
 
-  private final Queue<MonitorLog> queue;
+  private final Queue<IMonitorLog> queue;
   
   private final AtomicInteger size = new AtomicInteger(0);
 
   public MonitorQueue() {
-    this.queue = new ConcurrentLinkedQueue<MonitorLog>();
+    this.queue = new ConcurrentLinkedQueue<IMonitorLog>();
   }
 
-  public boolean enqueue(MonitorLog log) {
+  public boolean enqueue(IMonitorLog log) {
     boolean res = queue.add(log);
     size.incrementAndGet();
     return res;
   }
 
-  public MonitorLog dequeue() {
-    MonitorLog res = queue.poll();
+  public IMonitorLog dequeue() {
+    IMonitorLog res = queue.poll();
     if (res != null) {
       size.decrementAndGet();
     }

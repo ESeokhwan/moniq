@@ -1,6 +1,6 @@
-package moniq.writer;
+package moniq.writer.strategy;
 
-import moniq.MonitorLog;
+import moniq.IMonitorLog;
 
 public class NoOpWriteStrategy implements IMonitorLogWriteStrategy {
 
@@ -8,7 +8,7 @@ public class NoOpWriteStrategy implements IMonitorLogWriteStrategy {
     }
 
     @Override
-    public void write(MonitorLog log) {
+    public void write(IMonitorLog log) {
     }
 
     @Override

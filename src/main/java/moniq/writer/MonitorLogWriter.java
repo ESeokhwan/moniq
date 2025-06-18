@@ -1,6 +1,7 @@
 package moniq.writer;
 
 import moniq.MonitorQueue;
+import moniq.writer.strategy.IMonitorLogWriteStrategy;
 
 // TODO: add a feature to automatically flush if data in monitorQueue is not flushed within a certain time
 public class MonitorLogWriter implements Runnable {

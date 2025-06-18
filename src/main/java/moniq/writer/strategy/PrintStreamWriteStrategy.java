@@ -1,6 +1,6 @@
-package moniq.writer;
+package moniq.writer.strategy;
 
-import moniq.MonitorLog;
+import moniq.IMonitorLog;
 
 import java.io.PrintStream;
 
@@ -13,8 +13,9 @@ public class PrintStreamWriteStrategy implements IMonitorLogWriteStrategy {
     }
 
     @Override
-    public void write(MonitorLog log) {
-        outputStream.println(log.getType() + ", " + log.getId() + ", " + log.getTimestamp() + ", " + log.getState());
+    public void write(IMonitorLog log) {
+        String curLine = String.join(", ", log.getValues());
+        outputStream.println(curLine);
     }
 
     @Override
