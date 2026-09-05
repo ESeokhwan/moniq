@@ -1,13 +1,23 @@
 package moniq.util;
 
+import moniq.exception.ImproperUsageException;
+
 public class ExtractOnlyNaiveMessageAdaptor extends NaiveMessageAdaptor {
 
+  public ExtractOnlyNaiveMessageAdaptor() {
+    super();
+  }
+
+  /**
+   * @deprecated Message size is only needed when generating messages.
+   */
+  @Deprecated
   public ExtractOnlyNaiveMessageAdaptor(int messageSize) {
-    super(messageSize);
+    this();
   }
 
   @Override
-  protected String getRandomPadding(int size) {
-    throw new RuntimeException("This class is not for generating message. It is just for extracting message.");
+  protected String getRandomPadding(String content) {
+    throw new ImproperUsageException("Extract-only adaptor cannot generate messages.");
   }
 }

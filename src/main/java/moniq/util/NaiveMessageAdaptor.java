@@ -1,22 +1,21 @@
 package moniq.util;
 
+import java.util.Objects;
+
 public abstract class NaiveMessageAdaptor implements IMessageAdaptor {
 
   private final static char divChar = '!';
 
-  protected final int messageSize;
-
-  protected NaiveMessageAdaptor(int messageSize) {
-    this.messageSize = messageSize;
+  protected NaiveMessageAdaptor() {
   }
 
-  abstract String getRandomPadding(int paddingSize);
+  abstract String getRandomPadding(String content);
 
   @Override
-  public String generate(String messageId) {
-    int paddingSize = messageSize - messageId.length() - 1;
-    String padding = getRandomPadding(paddingSize);
-    return messageId + divChar + padding;
+  public String generate(String content) {
+    Objects.requireNonNull(content, "content must not be null");
+    String padding = getRandomPadding(content);
+    return content + divChar + padding;
   }
 
   @Override
