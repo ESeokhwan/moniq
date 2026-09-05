@@ -12,6 +12,7 @@ import java.util.concurrent.TimeUnit;
 import moniq.IMonitorLog;
 import moniq.MonitorLog;
 import moniq.MonitorQueue;
+import moniq.exception.NotProcessedException;
 import moniq.writer.strategy.IMonitorLogWriteStrategy;
 import org.junit.jupiter.api.Test;
 
@@ -38,6 +39,25 @@ class MonitorLogWriterTest {
     assertEquals(2, strategy.commitCount);
   }
 
+  @Test
+  void preprocessesEachLogBeforeWritingIt() throws Exception {
+    MonitorQueue queue = new MonitorQueue();
+    RecordingWriteStrategy strategy = new RecordingWriteStrategy();
+    MonitorLogWriter writer = new MonitorLogWriter(queue, strategy, 1);
+    queue.enqueue(new PreprocessingMonitorLog("preprocessed"));
+
+    Thread writerThread = new Thread(writer);
+    writerThread.start();
+
+    assertTrue(strategy.committed.await(2, TimeUnit.SECONDS));
+    writer.gracefulShutdown();
+    writer.syncedNotify();
+    writerThread.join(Duration.ofSeconds(2).toMillis());
+
+    assertFalse(writerThread.isAlive());
+    assertEquals(List.of("preprocessed"), strategy.writtenIds);
+  }
+
   private static final class RecordingWriteStrategy implements IMonitorLogWriteStrategy {
     private final List<String> writtenIds = new ArrayList<>();
     private final CountDownLatch committed = new CountDownLatch(1);
@@ -53,6 +73,33 @@ class MonitorLogWriterTest {
       commitCount++;
       committed.countDown();
       return true;
+    }
+  }
+
+  private static final class PreprocessingMonitorLog implements IMonitorLog {
+    private final String id;
+    private boolean processed;
+
+    private PreprocessingMonitorLog(String id) {
+      this.id = id;
+    }
+
+    @Override
+    public void preprocess() {
+      processed = true;
+    }
+
+    @Override
+    public List<String> getHeaders() {
+      return List.of("Type", "Id");
+    }
+
+    @Override
+    public List<String> getValues() {
+      if (!processed) {
+        throw new NotProcessedException();
+      }
+      return List.of("type", id);
     }
   }
 }
