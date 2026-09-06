@@ -1,20 +1,38 @@
 package moniq.writer;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import moniq.IMonitorLog;
 import moniq.MonitorQueue;
 import moniq.writer.strategy.IMonitorLogWriteStrategy;
 
+/**
+ * A one-shot queue consumer that preprocesses logs and writes them in FIFO batches.
+ *
+ * <p>Use {@link #submit(IMonitorLog)} for coordinated enqueueing. Call {@link
+ * #gracefulShutdown()} and join the owning thread to drain and close the writer lifecycle.
+ */
 public class MonitorLogWriter implements Runnable {
+
+  private static final AtomicInteger POOL_SEQUENCE = new AtomicInteger();
 
   private final MonitorQueue monitorQueue;
   private final IMonitorLogWriteStrategy writeStrategy;
   private final int batchSize;
   private final long flushTimeoutNanos;
+  private final MonitorLogErrorHandler errorHandler;
+  private final ExecutorService preprocessingExecutor;
 
   private final AtomicBoolean shutdownRequested = new AtomicBoolean();
   private final AtomicBoolean started = new AtomicBoolean();
@@ -22,7 +40,7 @@ public class MonitorLogWriter implements Runnable {
   private final Condition workAvailable = lifecycleLock.newCondition();
 
   private long pendingSinceNanos = Long.MIN_VALUE;
-  private int currentWrittenCount;
+  private boolean hasUncommittedWrites;
 
   public MonitorLogWriter(
       MonitorQueue monitorQueue, IMonitorLogWriteStrategy writeStrategy, int batchSize) {
@@ -34,6 +52,31 @@ public class MonitorLogWriter implements Runnable {
       IMonitorLogWriteStrategy writeStrategy,
       int batchSize,
       Duration flushTimeout) {
+    this(monitorQueue, writeStrategy, batchSize, flushTimeout, 1);
+  }
+
+  public MonitorLogWriter(
+      MonitorQueue monitorQueue,
+      IMonitorLogWriteStrategy writeStrategy,
+      int batchSize,
+      Duration flushTimeout,
+      int workerCount) {
+    this(
+        monitorQueue,
+        writeStrategy,
+        batchSize,
+        flushTimeout,
+        workerCount,
+        MonitorLogErrorHandler.rethrowing());
+  }
+
+  public MonitorLogWriter(
+      MonitorQueue monitorQueue,
+      IMonitorLogWriteStrategy writeStrategy,
+      int batchSize,
+      Duration flushTimeout,
+      int workerCount,
+      MonitorLogErrorHandler errorHandler) {
     this.monitorQueue = Objects.requireNonNull(monitorQueue, "monitorQueue must not be null");
     this.writeStrategy = Objects.requireNonNull(writeStrategy, "writeStrategy must not be null");
     if (batchSize == 0) {
@@ -41,6 +84,12 @@ public class MonitorLogWriter implements Runnable {
     }
     this.batchSize = batchSize;
     this.flushTimeoutNanos = toTimeoutNanos(flushTimeout);
+    if (workerCount <= 0) {
+      throw new IllegalArgumentException("workerCount must be greater than zero");
+    }
+    this.errorHandler = Objects.requireNonNull(errorHandler, "errorHandler must not be null");
+    this.preprocessingExecutor =
+        Executors.newFixedThreadPool(workerCount, newPreprocessingThreadFactory());
   }
 
   /**
@@ -125,12 +174,11 @@ public class MonitorLogWriter implements Runnable {
         boolean completeBatchReady = isBatchReady();
         int maximumCount = completeBatchReady ? batchSize : monitorQueue.size();
         processLogs(maximumCount);
-        if (!completeBatchReady && currentWrittenCount > 0) {
-          flushBatch();
-        }
+        flushBatch();
         resetPendingTimer();
       }
     } finally {
+      preprocessingExecutor.shutdownNow();
       flushBatch();
     }
   }
@@ -206,33 +254,67 @@ public class MonitorLogWriter implements Runnable {
   private void drainQueue() {
     while (!monitorQueue.isEmpty()) {
       processLogs(batchSize > 0 ? batchSize : Integer.MAX_VALUE);
-    }
-  }
-
-  private void processLogs(int maximumCount) {
-    int processedCount = 0;
-    while (processedCount < maximumCount) {
-      IMonitorLog log = monitorQueue.dequeue();
-      if (log == null) {
-        return;
-      }
-      log.preprocess();
-      writeStrategy.write(log);
-      currentWrittenCount++;
-      processedCount++;
-      tryFlushBatch();
-    }
-  }
-
-  private void tryFlushBatch() {
-    if (batchSize > 0 && currentWrittenCount >= batchSize) {
       flushBatch();
     }
   }
 
+  private void processLogs(int maximumCount) {
+    int initialCapacity = Math.max(0, Math.min(maximumCount, monitorQueue.size()));
+    List<IMonitorLog> logs = new ArrayList<>(initialCapacity);
+    while (logs.size() < maximumCount) {
+      IMonitorLog log = monitorQueue.dequeue();
+      if (log == null) {
+        break;
+      }
+      logs.add(log);
+    }
+
+    List<Future<?>> preprocessingResults = new ArrayList<>(logs.size());
+    for (IMonitorLog log : logs) {
+      preprocessingResults.add(preprocessingExecutor.submit(log::preprocess));
+    }
+
+    for (int i = 0; i < logs.size(); i++) {
+      IMonitorLog log = logs.get(i);
+      boolean preprocessed = awaitPreprocessing(log, preprocessingResults.get(i));
+      if (preprocessed) {
+        try {
+          writeStrategy.write(log);
+          hasUncommittedWrites = true;
+        } catch (Throwable error) {
+          errorHandler.handle(log, error);
+        }
+      }
+    }
+  }
+
+  private boolean awaitPreprocessing(IMonitorLog log, Future<?> preprocessingResult) {
+    boolean interrupted = false;
+    try {
+      while (true) {
+        try {
+          preprocessingResult.get();
+          return true;
+        } catch (InterruptedException e) {
+          interrupted = true;
+          shutdownRequested.set(true);
+        } catch (ExecutionException e) {
+          errorHandler.handle(log, e.getCause());
+          return false;
+        }
+      }
+    } finally {
+      if (interrupted) {
+        Thread.currentThread().interrupt();
+      }
+    }
+  }
+
   private void flushBatch() {
-    writeStrategy.commit();
-    currentWrittenCount = 0;
+    if (hasUncommittedWrites) {
+      writeStrategy.commit();
+      hasUncommittedWrites = false;
+    }
   }
 
   private static long toTimeoutNanos(Duration flushTimeout) {
@@ -245,5 +327,18 @@ public class MonitorLogWriter implements Runnable {
     } catch (ArithmeticException e) {
       throw new IllegalArgumentException("flushTimeout is too large", e);
     }
+  }
+
+  private static ThreadFactory newPreprocessingThreadFactory() {
+    int poolNumber = POOL_SEQUENCE.incrementAndGet();
+    AtomicInteger threadSequence = new AtomicInteger();
+    return task -> {
+      Thread thread =
+          new Thread(
+              task,
+              "moniq-preprocessor-" + poolNumber + "-" + threadSequence.incrementAndGet());
+      thread.setDaemon(true);
+      return thread;
+    };
   }
 }
