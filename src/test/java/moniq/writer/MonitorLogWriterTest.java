@@ -2,6 +2,7 @@ package moniq.writer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Duration;
@@ -31,7 +32,6 @@ class MonitorLogWriterTest {
 
     assertTrue(strategy.committed.await(2, TimeUnit.SECONDS));
     writer.gracefulShutdown();
-    writer.syncedNotify();
     writerThread.join(Duration.ofSeconds(2).toMillis());
 
     assertFalse(writerThread.isAlive());
@@ -51,11 +51,76 @@ class MonitorLogWriterTest {
 
     assertTrue(strategy.committed.await(2, TimeUnit.SECONDS));
     writer.gracefulShutdown();
-    writer.syncedNotify();
     writerThread.join(Duration.ofSeconds(2).toMillis());
 
     assertFalse(writerThread.isAlive());
     assertEquals(List.of("preprocessed"), strategy.writtenIds);
+  }
+
+  @Test
+  void shutdownWakesWriterAndFlushesAnIncompleteBatch() throws Exception {
+    MonitorQueue queue = new MonitorQueue();
+    RecordingWriteStrategy strategy = new RecordingWriteStrategy();
+    MonitorLogWriter writer = new MonitorLogWriter(queue, strategy, 2);
+    Thread writerThread = new Thread(writer);
+    writerThread.start();
+
+    writer.submit(new MonitorLog("type", "partial", "state", 1L, 10L));
+    assertFalse(strategy.committed.await(100, TimeUnit.MILLISECONDS));
+
+    writer.gracefulShutdown();
+    writerThread.join(Duration.ofSeconds(2).toMillis());
+
+    assertFalse(writerThread.isAlive());
+    assertEquals(List.of("partial"), strategy.writtenIds);
+    assertEquals(1, strategy.commitCount);
+  }
+
+  @Test
+  void submitWakesWriterWhenBatchBecomesReady() throws Exception {
+    MonitorQueue queue = new MonitorQueue();
+    RecordingWriteStrategy strategy = new RecordingWriteStrategy();
+    MonitorLogWriter writer = new MonitorLogWriter(queue, strategy, 1);
+    Thread writerThread = new Thread(writer);
+    writerThread.start();
+
+    writer.submit(new MonitorLog("type", "submitted", "state", 1L, 10L));
+
+    assertTrue(strategy.committed.await(2, TimeUnit.SECONDS));
+    writer.gracefulShutdown();
+    writerThread.join(Duration.ofSeconds(2).toMillis());
+    assertEquals(List.of("submitted"), strategy.writtenIds);
+  }
+
+  @Test
+  void rejectsSubmissionAfterShutdown() {
+    MonitorLogWriter writer =
+        new MonitorLogWriter(new MonitorQueue(), new RecordingWriteStrategy(), 1);
+
+    writer.gracefulShutdown();
+
+    assertThrows(
+        IllegalStateException.class,
+        () -> writer.submit(new MonitorLog("type", "late", "state", 1L, 10L)));
+  }
+
+  @Test
+  void rejectsInvalidConstructionAndMultipleRuns() {
+    assertThrows(
+        NullPointerException.class,
+        () -> new MonitorLogWriter(null, new RecordingWriteStrategy(), 1));
+    assertThrows(
+        NullPointerException.class,
+        () -> new MonitorLogWriter(new MonitorQueue(), null, 1));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> new MonitorLogWriter(new MonitorQueue(), new RecordingWriteStrategy(), 0));
+
+    MonitorLogWriter writer =
+        new MonitorLogWriter(new MonitorQueue(), new RecordingWriteStrategy(), 1);
+    writer.gracefulShutdown();
+    writer.run();
+    assertThrows(IllegalStateException.class, writer::run);
   }
 
   private static final class RecordingWriteStrategy implements IMonitorLogWriteStrategy {
