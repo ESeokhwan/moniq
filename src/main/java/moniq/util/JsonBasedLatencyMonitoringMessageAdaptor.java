@@ -3,9 +3,11 @@ package moniq.util;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.util.Map;
 
+/** Base implementation for latency metadata and payload contained in one JSON object. */
 public abstract class JsonBasedLatencyMonitoringMessageAdaptor
     implements ILatencyMonitoringMessageAdaptor {
 
+  /** Returns the payload to include in the next generated message. */
   protected abstract String getRandomPayload();
 
   @Override

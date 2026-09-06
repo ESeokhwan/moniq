@@ -5,6 +5,7 @@ import java.util.Objects;
 import moniq.exception.NotProcessedException;
 import moniq.util.ILatencyMonitoringMessageAdaptor;
 
+/** A latency log that defers message parsing until {@link #preprocess()} is invoked. */
 public class JsonBasedLatencyMonitorLog implements ILatencyMonitorLog {
 
   private static final List<String> HEADERS =
@@ -17,6 +18,14 @@ public class JsonBasedLatencyMonitorLog implements ILatencyMonitorLog {
 
   private volatile ExtractedValues extractedValues;
 
+  /**
+   * Creates a latency log for a received message.
+   *
+   * @param messageAdaptor adaptor matching the message format
+   * @param rawData complete received message
+   * @param status application-defined result status
+   * @param respondedAt response observation time in epoch milliseconds
+   */
   public JsonBasedLatencyMonitorLog(
       ILatencyMonitoringMessageAdaptor messageAdaptor,
       String rawData,

@@ -3,6 +3,7 @@ package moniq.util;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 
+/** Generates JSON latency messages with a pre-generated random payload pool. */
 public class JsonBasedLatencyMonitoringMessageGenerator
     extends JsonBasedLatencyMonitoringMessageAdaptor {
 
@@ -16,6 +17,9 @@ public class JsonBasedLatencyMonitoringMessageGenerator
   /**
    * Creates a generator with a payload of {@code payloadSize} Java characters. The complete JSON
    * message length varies with its metadata and JSON escaping.
+   *
+   * @param payloadSize number of alphanumeric payload characters
+   * @param preIndicesSize minimum size of the reusable random-character pool
    */
   public JsonBasedLatencyMonitoringMessageGenerator(int payloadSize, int preIndicesSize) {
     if (payloadSize < 0) {

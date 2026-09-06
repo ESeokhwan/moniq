@@ -2,6 +2,7 @@ package moniq.util;
 
 import moniq.exception.ImproperUsageException;
 
+/** Parses fast JSON latency messages but deliberately does not support generation. */
 public class FastExtractOnlyJsonBasedLatencyMonitoringMessageAdaptor
     extends FastJsonBasedLatencyMonitoringMessageAdaptor {
 

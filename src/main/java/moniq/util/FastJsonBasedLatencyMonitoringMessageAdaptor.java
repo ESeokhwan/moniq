@@ -4,11 +4,13 @@ import com.fasterxml.jackson.databind.JsonNode;
 import java.util.Map;
 import java.util.Objects;
 
+/** Base implementation for JSON latency metadata followed by {@code !} and an opaque payload. */
 public abstract class FastJsonBasedLatencyMonitoringMessageAdaptor
     implements ILatencyMonitoringMessageAdaptor {
 
   private static final char DIVIDER = '!';
 
+  /** Returns the payload to append to the next generated message. */
   protected abstract String getRandomPayload();
 
   @Override
@@ -51,6 +53,7 @@ public abstract class FastJsonBasedLatencyMonitoringMessageAdaptor
         LatencyMessageJsonSupport.parseObject(getPayloadRemoved(message)), key);
   }
 
+  /** Removes the payload suffix, if present, and returns the JSON metadata. */
   protected String getPayloadRemoved(String message) {
     Objects.requireNonNull(message, "message must not be null");
     int dividerIndex = message.lastIndexOf(DIVIDER);

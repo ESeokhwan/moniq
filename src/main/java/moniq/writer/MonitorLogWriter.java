@@ -93,8 +93,9 @@ public class MonitorLogWriter implements Runnable {
   }
 
   /**
-   * Enqueues a log and wakes the writer when a complete batch is ready.
+   * Enqueues a log and wakes the writer when a batch is ready or needs a timeout scheduled.
    *
+   * @param log log to enqueue
    * @throws IllegalStateException if shutdown has already been requested
    */
   public void submit(IMonitorLog log) {
@@ -114,6 +115,7 @@ public class MonitorLogWriter implements Runnable {
     }
   }
 
+  /** Requests shutdown, wakes the writer, and causes all queued logs to be drained. */
   public void gracefulShutdown() {
     lifecycleLock.lock();
     try {
