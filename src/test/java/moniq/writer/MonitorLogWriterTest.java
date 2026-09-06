@@ -115,12 +115,81 @@ class MonitorLogWriterTest {
     assertThrows(
         IllegalArgumentException.class,
         () -> new MonitorLogWriter(new MonitorQueue(), new RecordingWriteStrategy(), 0));
+    assertThrows(
+        NullPointerException.class,
+        () ->
+            new MonitorLogWriter(
+                new MonitorQueue(), new RecordingWriteStrategy(), 1, null));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new MonitorLogWriter(
+                new MonitorQueue(),
+                new RecordingWriteStrategy(),
+                1,
+                Duration.ofMillis(-1)));
 
     MonitorLogWriter writer =
         new MonitorLogWriter(new MonitorQueue(), new RecordingWriteStrategy(), 1);
     writer.gracefulShutdown();
     writer.run();
     assertThrows(IllegalStateException.class, writer::run);
+  }
+
+  @Test
+  void flushesAnIncompleteBatchAfterTimeout() throws Exception {
+    MonitorQueue queue = new MonitorQueue();
+    RecordingWriteStrategy strategy = new RecordingWriteStrategy();
+    MonitorLogWriter writer =
+        new MonitorLogWriter(queue, strategy, 10, Duration.ofMillis(50));
+    Thread writerThread = new Thread(writer);
+    writerThread.start();
+
+    writer.submit(new MonitorLog("type", "timed", "state", 1L, 10L));
+
+    assertTrue(strategy.committed.await(2, TimeUnit.SECONDS));
+    assertEquals(List.of("timed"), strategy.writtenIds);
+    writer.gracefulShutdown();
+    writerThread.join(Duration.ofSeconds(2).toMillis());
+    assertFalse(writerThread.isAlive());
+  }
+
+  @Test
+  void unboundedBatchFlushesAllPendingLogsOnTimeout() throws Exception {
+    MonitorQueue queue = new MonitorQueue();
+    RecordingWriteStrategy strategy = new RecordingWriteStrategy();
+    MonitorLogWriter writer =
+        new MonitorLogWriter(queue, strategy, -1, Duration.ofMillis(50));
+    Thread writerThread = new Thread(writer);
+    writerThread.start();
+
+    writer.submit(new MonitorLog("type", "first", "state", 1L, 10L));
+    writer.submit(new MonitorLog("type", "second", "state", 2L, 20L));
+    writer.submit(new MonitorLog("type", "third", "state", 3L, 30L));
+
+    assertTrue(strategy.committed.await(2, TimeUnit.SECONDS));
+    assertEquals(List.of("first", "second", "third"), strategy.writtenIds);
+    writer.gracefulShutdown();
+    writerThread.join(Duration.ofSeconds(2).toMillis());
+    assertFalse(writerThread.isAlive());
+  }
+
+  @Test
+  void unboundedBatchWithoutTimeoutWaitsForShutdown() throws Exception {
+    MonitorQueue queue = new MonitorQueue();
+    RecordingWriteStrategy strategy = new RecordingWriteStrategy();
+    MonitorLogWriter writer = new MonitorLogWriter(queue, strategy, -1);
+    Thread writerThread = new Thread(writer);
+    writerThread.start();
+
+    writer.submit(new MonitorLog("type", "pending", "state", 1L, 10L));
+    assertFalse(strategy.committed.await(100, TimeUnit.MILLISECONDS));
+
+    writer.gracefulShutdown();
+    writerThread.join(Duration.ofSeconds(2).toMillis());
+    assertFalse(writerThread.isAlive());
+    assertEquals(List.of("pending"), strategy.writtenIds);
+    assertEquals(1, strategy.commitCount);
   }
 
   private static final class RecordingWriteStrategy implements IMonitorLogWriteStrategy {

@@ -1,5 +1,6 @@
 package moniq.writer;
 
+import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
@@ -13,22 +14,33 @@ public class MonitorLogWriter implements Runnable {
   private final MonitorQueue monitorQueue;
   private final IMonitorLogWriteStrategy writeStrategy;
   private final int batchSize;
+  private final long flushTimeoutNanos;
 
   private final AtomicBoolean shutdownRequested = new AtomicBoolean();
   private final AtomicBoolean started = new AtomicBoolean();
   private final ReentrantLock lifecycleLock = new ReentrantLock();
   private final Condition workAvailable = lifecycleLock.newCondition();
 
+  private long pendingSinceNanos = Long.MIN_VALUE;
   private int currentWrittenCount;
 
   public MonitorLogWriter(
       MonitorQueue monitorQueue, IMonitorLogWriteStrategy writeStrategy, int batchSize) {
+    this(monitorQueue, writeStrategy, batchSize, Duration.ZERO);
+  }
+
+  public MonitorLogWriter(
+      MonitorQueue monitorQueue,
+      IMonitorLogWriteStrategy writeStrategy,
+      int batchSize,
+      Duration flushTimeout) {
     this.monitorQueue = Objects.requireNonNull(monitorQueue, "monitorQueue must not be null");
     this.writeStrategy = Objects.requireNonNull(writeStrategy, "writeStrategy must not be null");
     if (batchSize == 0) {
       throw new IllegalArgumentException("batchSize must not be zero");
     }
     this.batchSize = batchSize;
+    this.flushTimeoutNanos = toTimeoutNanos(flushTimeout);
   }
 
   /**
@@ -44,7 +56,8 @@ public class MonitorLogWriter implements Runnable {
         throw new IllegalStateException("MonitorLogWriter is shutting down.");
       }
       monitorQueue.enqueue(log);
-      if (isBatchReady()) {
+      markPendingIfNeeded();
+      if (shouldSignalForCurrentQueue()) {
         workAvailable.signal();
       }
     } finally {
@@ -83,11 +96,12 @@ public class MonitorLogWriter implements Runnable {
     }
   }
 
-  /** Signals the writer if the externally managed queue contains a complete batch. */
+  /** Signals the writer if the externally managed queue is ready or needs a timeout scheduled. */
   public void notifyIfNeeded() {
     lifecycleLock.lock();
     try {
-      if (isBatchReady()) {
+      markPendingIfNeeded();
+      if (shouldSignalForCurrentQueue()) {
         workAvailable.signal();
       }
     } finally {
@@ -108,7 +122,13 @@ public class MonitorLogWriter implements Runnable {
           drainQueue();
           return;
         }
-        processLogs(batchSize);
+        boolean completeBatchReady = isBatchReady();
+        int maximumCount = completeBatchReady ? batchSize : monitorQueue.size();
+        processLogs(maximumCount);
+        if (!completeBatchReady && currentWrittenCount > 0) {
+          flushBatch();
+        }
+        resetPendingTimer();
       }
     } finally {
       flushBatch();
@@ -118,12 +138,33 @@ public class MonitorLogWriter implements Runnable {
   private void awaitBatchOrShutdown() {
     lifecycleLock.lock();
     try {
-      while (!shutdownRequested.get() && !isBatchReady()) {
+      while (!shutdownRequested.get()) {
+        if (isBatchReady()) {
+          return;
+        }
+
+        if (monitorQueue.isEmpty()) {
+          pendingSinceNanos = Long.MIN_VALUE;
+        } else if (flushTimeoutNanos > 0) {
+          markPendingIfNeeded();
+          long elapsedNanos = System.nanoTime() - pendingSinceNanos;
+          long remainingNanos = flushTimeoutNanos - elapsedNanos;
+          if (remainingNanos <= 0) {
+            return;
+          }
+          try {
+            workAvailable.awaitNanos(remainingNanos);
+          } catch (InterruptedException e) {
+            requestShutdownAfterInterrupt();
+            return;
+          }
+          continue;
+        }
+
         try {
           workAvailable.await();
         } catch (InterruptedException e) {
-          shutdownRequested.set(true);
-          Thread.currentThread().interrupt();
+          requestShutdownAfterInterrupt();
           return;
         }
       }
@@ -134,6 +175,32 @@ public class MonitorLogWriter implements Runnable {
 
   private boolean isBatchReady() {
     return batchSize > 0 && monitorQueue.size() >= batchSize;
+  }
+
+  private boolean shouldSignalForCurrentQueue() {
+    return isBatchReady() || (flushTimeoutNanos > 0 && !monitorQueue.isEmpty());
+  }
+
+  private void markPendingIfNeeded() {
+    if (flushTimeoutNanos > 0
+        && pendingSinceNanos == Long.MIN_VALUE
+        && !monitorQueue.isEmpty()) {
+      pendingSinceNanos = System.nanoTime();
+    }
+  }
+
+  private void resetPendingTimer() {
+    lifecycleLock.lock();
+    try {
+      pendingSinceNanos = monitorQueue.isEmpty() ? Long.MIN_VALUE : System.nanoTime();
+    } finally {
+      lifecycleLock.unlock();
+    }
+  }
+
+  private void requestShutdownAfterInterrupt() {
+    shutdownRequested.set(true);
+    Thread.currentThread().interrupt();
   }
 
   private void drainQueue() {
@@ -166,5 +233,17 @@ public class MonitorLogWriter implements Runnable {
   private void flushBatch() {
     writeStrategy.commit();
     currentWrittenCount = 0;
+  }
+
+  private static long toTimeoutNanos(Duration flushTimeout) {
+    Objects.requireNonNull(flushTimeout, "flushTimeout must not be null");
+    if (flushTimeout.isNegative()) {
+      throw new IllegalArgumentException("flushTimeout must not be negative");
+    }
+    try {
+      return flushTimeout.toNanos();
+    } catch (ArithmeticException e) {
+      throw new IllegalArgumentException("flushTimeout is too large", e);
+    }
   }
 }
