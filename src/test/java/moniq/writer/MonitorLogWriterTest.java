@@ -24,7 +24,8 @@ class MonitorLogWriterTest {
   void writesAndCommitsACompleteBatch() throws Exception {
     MonitorQueue queue = new MonitorQueue();
     RecordingWriteStrategy strategy = new RecordingWriteStrategy();
-    MonitorLogWriter writer = new MonitorLogWriter(queue, strategy, 2);
+    MonitorLogWriter writer =
+        new MonitorLogWriter(queue, strategy, BatchPolicy.fixedSize(2));
     queue.enqueue(new MonitorLog("type", "first", "state", 1L, 10L));
     queue.enqueue(new MonitorLog("type", "second", "state", 2L, 20L));
 
@@ -44,7 +45,8 @@ class MonitorLogWriterTest {
   void preprocessesEachLogBeforeWritingIt() throws Exception {
     MonitorQueue queue = new MonitorQueue();
     RecordingWriteStrategy strategy = new RecordingWriteStrategy();
-    MonitorLogWriter writer = new MonitorLogWriter(queue, strategy, 1);
+    MonitorLogWriter writer =
+        new MonitorLogWriter(queue, strategy, BatchPolicy.fixedSize(1));
     queue.enqueue(new PreprocessingMonitorLog("preprocessed"));
 
     Thread writerThread = new Thread(writer);
@@ -62,7 +64,8 @@ class MonitorLogWriterTest {
   void shutdownWakesWriterAndFlushesAnIncompleteBatch() throws Exception {
     MonitorQueue queue = new MonitorQueue();
     RecordingWriteStrategy strategy = new RecordingWriteStrategy();
-    MonitorLogWriter writer = new MonitorLogWriter(queue, strategy, 2);
+    MonitorLogWriter writer =
+        new MonitorLogWriter(queue, strategy, BatchPolicy.fixedSize(2));
     Thread writerThread = new Thread(writer);
     writerThread.start();
 
@@ -81,7 +84,8 @@ class MonitorLogWriterTest {
   void submitWakesWriterWhenBatchBecomesReady() throws Exception {
     MonitorQueue queue = new MonitorQueue();
     RecordingWriteStrategy strategy = new RecordingWriteStrategy();
-    MonitorLogWriter writer = new MonitorLogWriter(queue, strategy, 1);
+    MonitorLogWriter writer =
+        new MonitorLogWriter(queue, strategy, BatchPolicy.fixedSize(1));
     Thread writerThread = new Thread(writer);
     writerThread.start();
 
@@ -96,7 +100,8 @@ class MonitorLogWriterTest {
   @Test
   void rejectsSubmissionAfterShutdown() {
     MonitorLogWriter writer =
-        new MonitorLogWriter(new MonitorQueue(), new RecordingWriteStrategy(), 1);
+        new MonitorLogWriter(
+            new MonitorQueue(), new RecordingWriteStrategy(), BatchPolicy.fixedSize(1));
 
     writer.gracefulShutdown();
 
@@ -108,7 +113,8 @@ class MonitorLogWriterTest {
   @Test
   void emptyShutdownDoesNotCommit() {
     RecordingWriteStrategy strategy = new RecordingWriteStrategy();
-    MonitorLogWriter writer = new MonitorLogWriter(new MonitorQueue(), strategy, 1);
+    MonitorLogWriter writer =
+        new MonitorLogWriter(new MonitorQueue(), strategy, BatchPolicy.fixedSize(1));
 
     writer.gracefulShutdown();
     writer.run();
@@ -120,34 +126,35 @@ class MonitorLogWriterTest {
   void rejectsInvalidConstructionAndMultipleRuns() {
     assertThrows(
         NullPointerException.class,
-        () -> new MonitorLogWriter(null, new RecordingWriteStrategy(), 1));
+        () ->
+            new MonitorLogWriter(
+                null, new RecordingWriteStrategy(), BatchPolicy.fixedSize(1)));
     assertThrows(
         NullPointerException.class,
-        () -> new MonitorLogWriter(new MonitorQueue(), null, 1));
-    assertThrows(
-        IllegalArgumentException.class,
-        () -> new MonitorLogWriter(new MonitorQueue(), new RecordingWriteStrategy(), 0));
+        () -> new MonitorLogWriter(new MonitorQueue(), null, BatchPolicy.fixedSize(1)));
     assertThrows(
         NullPointerException.class,
         () ->
             new MonitorLogWriter(
-                new MonitorQueue(), new RecordingWriteStrategy(), 1, null));
+                new MonitorQueue(),
+                new RecordingWriteStrategy(),
+                (BatchPolicy) null));
+    assertThrows(
+        NullPointerException.class,
+        () ->
+            new MonitorLogWriter(
+                new MonitorQueue(),
+                new RecordingWriteStrategy(),
+                BatchPolicy.fixedSize(1),
+                null));
     assertThrows(
         IllegalArgumentException.class,
         () ->
             new MonitorLogWriter(
                 new MonitorQueue(),
                 new RecordingWriteStrategy(),
-                1,
-                Duration.ofMillis(-1)));
-    assertThrows(
-        IllegalArgumentException.class,
-        () ->
-            new MonitorLogWriter(
-                new MonitorQueue(),
-                new RecordingWriteStrategy(),
-                1,
-                Duration.ZERO,
+                BatchPolicy.fixedSize(1),
+                FlushPolicy.disabled(),
                 0));
     assertThrows(
         NullPointerException.class,
@@ -155,13 +162,14 @@ class MonitorLogWriterTest {
             new MonitorLogWriter(
                 new MonitorQueue(),
                 new RecordingWriteStrategy(),
-                1,
-                Duration.ZERO,
+                BatchPolicy.fixedSize(1),
+                FlushPolicy.disabled(),
                 1,
                 null));
 
     MonitorLogWriter writer =
-        new MonitorLogWriter(new MonitorQueue(), new RecordingWriteStrategy(), 1);
+        new MonitorLogWriter(
+            new MonitorQueue(), new RecordingWriteStrategy(), BatchPolicy.fixedSize(1));
     writer.gracefulShutdown();
     writer.run();
     assertThrows(IllegalStateException.class, writer::run);
@@ -172,7 +180,11 @@ class MonitorLogWriterTest {
     MonitorQueue queue = new MonitorQueue();
     RecordingWriteStrategy strategy = new RecordingWriteStrategy();
     MonitorLogWriter writer =
-        new MonitorLogWriter(queue, strategy, 10, Duration.ofMillis(50));
+        new MonitorLogWriter(
+            queue,
+            strategy,
+            BatchPolicy.fixedSize(10),
+            FlushPolicy.after(Duration.ofMillis(50)));
     Thread writerThread = new Thread(writer);
     writerThread.start();
 
@@ -190,7 +202,11 @@ class MonitorLogWriterTest {
     MonitorQueue queue = new MonitorQueue();
     RecordingWriteStrategy strategy = new RecordingWriteStrategy();
     MonitorLogWriter writer =
-        new MonitorLogWriter(queue, strategy, -1, Duration.ofMillis(50));
+        new MonitorLogWriter(
+            queue,
+            strategy,
+            BatchPolicy.unbounded(),
+            FlushPolicy.after(Duration.ofMillis(50)));
     Thread writerThread = new Thread(writer);
     writerThread.start();
 
@@ -209,7 +225,8 @@ class MonitorLogWriterTest {
   void unboundedBatchWithoutTimeoutWaitsForShutdown() throws Exception {
     MonitorQueue queue = new MonitorQueue();
     RecordingWriteStrategy strategy = new RecordingWriteStrategy();
-    MonitorLogWriter writer = new MonitorLogWriter(queue, strategy, -1);
+    MonitorLogWriter writer =
+        new MonitorLogWriter(queue, strategy, BatchPolicy.unbounded());
     Thread writerThread = new Thread(writer);
     writerThread.start();
 
@@ -230,7 +247,12 @@ class MonitorLogWriterTest {
     CountDownLatch releaseFirst = new CountDownLatch(1);
     CountDownLatch secondStarted = new CountDownLatch(1);
     MonitorLogWriter writer =
-        new MonitorLogWriter(queue, strategy, 2, Duration.ZERO, 2);
+        new MonitorLogWriter(
+            queue,
+            strategy,
+            BatchPolicy.fixedSize(2),
+            FlushPolicy.disabled(),
+            2);
     Thread writerThread = new Thread(writer);
     writerThread.start();
 
@@ -260,7 +282,12 @@ class MonitorLogWriterTest {
     CountDownLatch firstProcessed = new CountDownLatch(1);
     CountDownLatch secondProcessed = new CountDownLatch(1);
     MonitorLogWriter writer =
-        new MonitorLogWriter(queue, strategy, 1, Duration.ZERO, 1);
+        new MonitorLogWriter(
+            queue,
+            strategy,
+            BatchPolicy.fixedSize(1),
+            FlushPolicy.disabled(),
+            1);
     Thread writerThread = new Thread(writer);
     writerThread.start();
 
@@ -287,8 +314,8 @@ class MonitorLogWriterTest {
         new MonitorLogWriter(
             queue,
             strategy,
-            2,
-            Duration.ZERO,
+            BatchPolicy.fixedSize(2),
+            FlushPolicy.disabled(),
             2,
             (log, error) -> {
               failedLog.set(log);
@@ -312,6 +339,25 @@ class MonitorLogWriterTest {
     assertEquals(failingLog, failedLog.get());
     assertEquals("preprocessing failed", reportedError.get().getMessage());
     assertEquals(List.of("written"), strategy.writtenIds);
+  }
+
+  @Test
+  @SuppressWarnings("deprecation")
+  void keepsLegacyNumericConfigurationCompatible() throws Exception {
+    MonitorQueue queue = new MonitorQueue();
+    RecordingWriteStrategy strategy = new RecordingWriteStrategy();
+    MonitorLogWriter writer =
+        new MonitorLogWriter(queue, strategy, -1, Duration.ofMillis(50));
+    Thread writerThread = new Thread(writer);
+    writerThread.start();
+
+    writer.submit(new MonitorLog("type", "legacy", "state", 1L, 10L));
+
+    assertTrue(strategy.committed.await(2, TimeUnit.SECONDS));
+    writer.gracefulShutdown();
+    writerThread.join(Duration.ofSeconds(2).toMillis());
+    assertFalse(writerThread.isAlive());
+    assertEquals(List.of("legacy"), strategy.writtenIds);
   }
 
   private static final class RecordingWriteStrategy implements IMonitorLogWriteStrategy {

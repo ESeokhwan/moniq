@@ -18,8 +18,8 @@ IMonitorLogWriteStrategy strategy = new ScrapableWriteStrategy(System.out);
 MonitorLogWriter writer = new MonitorLogWriter(
     queue,
     strategy,
-    1_000,
-    Duration.ofSeconds(1),
+    BatchPolicy.fixedSize(1_000),
+    FlushPolicy.after(Duration.ofSeconds(1)),
     4);
 
 Thread writerThread = new Thread(writer, "moniq-writer");
@@ -54,18 +54,27 @@ start its timeout.
 `run()` again after it exits. Calling `submit()` after `gracefulShutdown()` throws an
 `IllegalStateException`.
 
-Batch behavior is controlled by `batchSize` and `flushTimeout`:
+Batch behavior is controlled by explicit `BatchPolicy` and `FlushPolicy` values:
 
 | Configuration | Behavior |
 | --- | --- |
-| `batchSize > 0`, zero timeout | Flush when a complete batch accumulates |
-| `batchSize > 0`, positive timeout | Flush at batch size or when the oldest pending batch times out |
-| `batchSize < 0`, positive timeout | Unbounded batch; flush all currently pending logs on timeout |
-| `batchSize < 0`, zero timeout | Hold all logs until shutdown |
-| `batchSize == 0` | Invalid configuration |
+| `fixedSize(n)`, `disabled()` | Flush when `n` logs accumulate |
+| `fixedSize(n)`, `after(duration)` | Flush at `n` logs or when the pending batch times out |
+| `unbounded()`, `after(duration)` | Flush all currently pending logs on timeout |
+| `unbounded()`, `disabled()` | Hold all logs until shutdown |
 
-`Duration.ZERO` disables timed flushing. A negative timeout and a non-positive worker count are
-invalid.
+`fixedSize()` and `after()` accept only positive values. Disabling a timeout or removing the size
+boundary is represented by a named policy rather than a numeric sentinel:
+
+```java
+BatchPolicy fixed = BatchPolicy.fixedSize(1_000);
+BatchPolicy unbounded = BatchPolicy.unbounded();
+FlushPolicy timed = FlushPolicy.after(Duration.ofSeconds(1));
+FlushPolicy noTimeout = FlushPolicy.disabled();
+```
+
+The older numeric constructors remain available for source compatibility but are deprecated. They
+translate a negative batch size to `unbounded()` and `Duration.ZERO` to `disabled()`.
 
 On shutdown, the writer wakes automatically, stops accepting `submit()` calls, drains queued logs,
 flushes the strategy, and terminates. The caller still owns the writer thread and must `join()` it.
@@ -84,8 +93,8 @@ drops a failed log. Supply a handler to report an error and continue with the re
 MonitorLogWriter writer = new MonitorLogWriter(
     queue,
     strategy,
-    1_000,
-    Duration.ofSeconds(1),
+    BatchPolicy.fixedSize(1_000),
+    FlushPolicy.after(Duration.ofSeconds(1)),
     4,
     (log, error) -> error.printStackTrace());
 ```

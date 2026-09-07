@@ -29,7 +29,7 @@ public class MonitorLogWriter implements Runnable {
 
   private final MonitorQueue monitorQueue;
   private final IMonitorLogWriteStrategy writeStrategy;
-  private final int batchSize;
+  private final BatchPolicy batchPolicy;
   private final long flushTimeoutNanos;
   private final MonitorLogErrorHandler errorHandler;
   private final ExecutorService preprocessingExecutor;
@@ -42,11 +42,20 @@ public class MonitorLogWriter implements Runnable {
   private long pendingSinceNanos = Long.MIN_VALUE;
   private boolean hasUncommittedWrites;
 
+  /**
+   * @deprecated Use {@link #MonitorLogWriter(MonitorQueue, IMonitorLogWriteStrategy, BatchPolicy)}.
+   */
+  @Deprecated
   public MonitorLogWriter(
       MonitorQueue monitorQueue, IMonitorLogWriteStrategy writeStrategy, int batchSize) {
     this(monitorQueue, writeStrategy, batchSize, Duration.ZERO);
   }
 
+  /**
+   * @deprecated Use {@link #MonitorLogWriter(MonitorQueue, IMonitorLogWriteStrategy, BatchPolicy,
+   *     FlushPolicy)}.
+   */
+  @Deprecated
   public MonitorLogWriter(
       MonitorQueue monitorQueue,
       IMonitorLogWriteStrategy writeStrategy,
@@ -55,6 +64,11 @@ public class MonitorLogWriter implements Runnable {
     this(monitorQueue, writeStrategy, batchSize, flushTimeout, 1);
   }
 
+  /**
+   * @deprecated Use {@link #MonitorLogWriter(MonitorQueue, IMonitorLogWriteStrategy, BatchPolicy,
+   *     FlushPolicy, int)}.
+   */
+  @Deprecated
   public MonitorLogWriter(
       MonitorQueue monitorQueue,
       IMonitorLogWriteStrategy writeStrategy,
@@ -70,6 +84,11 @@ public class MonitorLogWriter implements Runnable {
         MonitorLogErrorHandler.rethrowing());
   }
 
+  /**
+   * @deprecated Use {@link #MonitorLogWriter(MonitorQueue, IMonitorLogWriteStrategy, BatchPolicy,
+   *     FlushPolicy, int, MonitorLogErrorHandler)}.
+   */
+  @Deprecated
   public MonitorLogWriter(
       MonitorQueue monitorQueue,
       IMonitorLogWriteStrategy writeStrategy,
@@ -77,13 +96,56 @@ public class MonitorLogWriter implements Runnable {
       Duration flushTimeout,
       int workerCount,
       MonitorLogErrorHandler errorHandler) {
+    this(
+        monitorQueue,
+        writeStrategy,
+        legacyBatchPolicy(batchSize),
+        legacyFlushPolicy(flushTimeout),
+        workerCount,
+        errorHandler);
+  }
+
+  public MonitorLogWriter(
+      MonitorQueue monitorQueue,
+      IMonitorLogWriteStrategy writeStrategy,
+      BatchPolicy batchPolicy) {
+    this(monitorQueue, writeStrategy, batchPolicy, FlushPolicy.disabled());
+  }
+
+  public MonitorLogWriter(
+      MonitorQueue monitorQueue,
+      IMonitorLogWriteStrategy writeStrategy,
+      BatchPolicy batchPolicy,
+      FlushPolicy flushPolicy) {
+    this(monitorQueue, writeStrategy, batchPolicy, flushPolicy, 1);
+  }
+
+  public MonitorLogWriter(
+      MonitorQueue monitorQueue,
+      IMonitorLogWriteStrategy writeStrategy,
+      BatchPolicy batchPolicy,
+      FlushPolicy flushPolicy,
+      int workerCount) {
+    this(
+        monitorQueue,
+        writeStrategy,
+        batchPolicy,
+        flushPolicy,
+        workerCount,
+        MonitorLogErrorHandler.rethrowing());
+  }
+
+  public MonitorLogWriter(
+      MonitorQueue monitorQueue,
+      IMonitorLogWriteStrategy writeStrategy,
+      BatchPolicy batchPolicy,
+      FlushPolicy flushPolicy,
+      int workerCount,
+      MonitorLogErrorHandler errorHandler) {
     this.monitorQueue = Objects.requireNonNull(monitorQueue, "monitorQueue must not be null");
     this.writeStrategy = Objects.requireNonNull(writeStrategy, "writeStrategy must not be null");
-    if (batchSize == 0) {
-      throw new IllegalArgumentException("batchSize must not be zero");
-    }
-    this.batchSize = batchSize;
-    this.flushTimeoutNanos = toTimeoutNanos(flushTimeout);
+    this.batchPolicy = Objects.requireNonNull(batchPolicy, "batchPolicy must not be null");
+    this.flushTimeoutNanos = toTimeoutNanos(flushPolicy);
     if (workerCount <= 0) {
       throw new IllegalArgumentException("workerCount must be greater than zero");
     }
@@ -174,7 +236,7 @@ public class MonitorLogWriter implements Runnable {
           return;
         }
         boolean completeBatchReady = isBatchReady();
-        int maximumCount = completeBatchReady ? batchSize : monitorQueue.size();
+        int maximumCount = completeBatchReady ? fixedBatchSize() : monitorQueue.size();
         processLogs(maximumCount);
         flushBatch();
         resetPendingTimer();
@@ -224,7 +286,8 @@ public class MonitorLogWriter implements Runnable {
   }
 
   private boolean isBatchReady() {
-    return batchSize > 0 && monitorQueue.size() >= batchSize;
+    return batchPolicy instanceof BatchPolicy.FixedSize fixedSize
+        && monitorQueue.size() >= fixedSize.size();
   }
 
   private boolean shouldSignalForCurrentQueue() {
@@ -255,7 +318,8 @@ public class MonitorLogWriter implements Runnable {
 
   private void drainQueue() {
     while (!monitorQueue.isEmpty()) {
-      processLogs(batchSize > 0 ? batchSize : Integer.MAX_VALUE);
+      processLogs(
+          batchPolicy instanceof BatchPolicy.FixedSize ? fixedBatchSize() : Integer.MAX_VALUE);
       flushBatch();
     }
   }
@@ -319,16 +383,25 @@ public class MonitorLogWriter implements Runnable {
     }
   }
 
-  private static long toTimeoutNanos(Duration flushTimeout) {
+  private int fixedBatchSize() {
+    return ((BatchPolicy.FixedSize) batchPolicy).size();
+  }
+
+  private static long toTimeoutNanos(FlushPolicy flushPolicy) {
+    Objects.requireNonNull(flushPolicy, "flushPolicy must not be null");
+    if (flushPolicy instanceof FlushPolicy.After after) {
+      return after.timeout().toNanos();
+    }
+    return 0L;
+  }
+
+  private static BatchPolicy legacyBatchPolicy(int batchSize) {
+    return batchSize < 0 ? BatchPolicy.unbounded() : BatchPolicy.fixedSize(batchSize);
+  }
+
+  private static FlushPolicy legacyFlushPolicy(Duration flushTimeout) {
     Objects.requireNonNull(flushTimeout, "flushTimeout must not be null");
-    if (flushTimeout.isNegative()) {
-      throw new IllegalArgumentException("flushTimeout must not be negative");
-    }
-    try {
-      return flushTimeout.toNanos();
-    } catch (ArithmeticException e) {
-      throw new IllegalArgumentException("flushTimeout is too large", e);
-    }
+    return flushTimeout.isZero() ? FlushPolicy.disabled() : FlushPolicy.after(flushTimeout);
   }
 
   private static ThreadFactory newPreprocessingThreadFactory() {
