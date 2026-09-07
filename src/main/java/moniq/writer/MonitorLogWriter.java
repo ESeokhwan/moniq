@@ -11,8 +11,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 import moniq.IMonitorLog;
 import moniq.MonitorQueue;
 import moniq.writer.strategy.IMonitorLogWriteStrategy;
@@ -20,8 +20,9 @@ import moniq.writer.strategy.IMonitorLogWriteStrategy;
 /**
  * A one-shot queue consumer that preprocesses logs and writes them in FIFO batches.
  *
- * <p>Use {@link #submit(IMonitorLog)} for coordinated enqueueing. Call {@link
- * #gracefulShutdown()} and join the owning thread to drain and close the writer lifecycle.
+ * <p>Use {@link #submit(IMonitorLog)} for enqueueing without a shared producer lock. Call {@link
+ * #gracefulShutdown()} and join the owning thread to drain accepted submissions and close the
+ * writer lifecycle.
  */
 public class MonitorLogWriter implements Runnable {
 
@@ -34,10 +35,12 @@ public class MonitorLogWriter implements Runnable {
   private final MonitorLogErrorHandler errorHandler;
   private final ExecutorService preprocessingExecutor;
 
-  private final AtomicBoolean shutdownRequested = new AtomicBoolean();
+  private final AtomicBoolean accepting = new AtomicBoolean(true);
+  private final AtomicInteger inFlightSubmissions = new AtomicInteger();
   private final AtomicBoolean started = new AtomicBoolean();
-  private final ReentrantLock lifecycleLock = new ReentrantLock();
-  private final Condition workAvailable = lifecycleLock.newCondition();
+  private final AtomicBoolean wakeupRequested = new AtomicBoolean();
+  private final AtomicReference<Thread> writerThread = new AtomicReference<>();
+  private final AtomicReference<Thread> legacyWaiter = new AtomicReference<>();
 
   private long pendingSinceNanos = Long.MIN_VALUE;
   private boolean hasUncommittedWrites;
@@ -158,68 +161,59 @@ public class MonitorLogWriter implements Runnable {
    * Enqueues a log and wakes the writer when a batch is ready or needs a timeout scheduled.
    *
    * @param log log to enqueue
-   * @throws IllegalStateException if shutdown has already been requested
+   * @throws IllegalStateException if the writer is no longer accepting submissions
    */
   public void submit(IMonitorLog log) {
     Objects.requireNonNull(log, "log must not be null");
-    lifecycleLock.lock();
+    inFlightSubmissions.incrementAndGet();
     try {
-      if (shutdownRequested.get()) {
+      if (!accepting.get()) {
         throw new IllegalStateException("MonitorLogWriter is shutting down.");
       }
       monitorQueue.enqueue(log);
-      markPendingIfNeeded();
-      if (shouldSignalForCurrentQueue()) {
-        workAvailable.signal();
-      }
     } finally {
-      lifecycleLock.unlock();
+      inFlightSubmissions.decrementAndGet();
+      signalWriter();
     }
   }
 
   /** Requests shutdown, wakes the writer, and causes all queued logs to be drained. */
   public void gracefulShutdown() {
-    lifecycleLock.lock();
-    try {
-      shutdownRequested.set(true);
-      workAvailable.signalAll();
-    } finally {
-      lifecycleLock.unlock();
-    }
+    accepting.set(false);
+    signalWriter();
   }
 
-  /** Waits for a signal. Prefer {@link #submit(IMonitorLog)} for normal producer usage. */
+  /**
+   * Parks the current thread until it is interrupted or spuriously awakened.
+   *
+   * @deprecated This lifecycle primitive is no longer used by the writer. Prefer {@link
+   *     #submit(IMonitorLog)}.
+   */
+  @Deprecated
   public void syncedWait() {
-    lifecycleLock.lock();
+    Thread currentThread = Thread.currentThread();
+    if (!legacyWaiter.compareAndSet(null, currentThread)) {
+      throw new IllegalStateException("Only one thread can use syncedWait at a time.");
+    }
     try {
-      workAvailable.await();
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
+      LockSupport.park(this);
     } finally {
-      lifecycleLock.unlock();
+      legacyWaiter.compareAndSet(currentThread, null);
     }
   }
 
+  /** Wakes the writer thread if it is parked. */
   public void syncedNotify() {
-    lifecycleLock.lock();
-    try {
-      workAvailable.signalAll();
-    } finally {
-      lifecycleLock.unlock();
+    Thread waiter = legacyWaiter.get();
+    if (waiter != null) {
+      LockSupport.unpark(waiter);
     }
+    signalWriter();
   }
 
   /** Signals the writer if the externally managed queue is ready or needs a timeout scheduled. */
   public void notifyIfNeeded() {
-    lifecycleLock.lock();
-    try {
-      markPendingIfNeeded();
-      if (shouldSignalForCurrentQueue()) {
-        workAvailable.signal();
-      }
-    } finally {
-      lifecycleLock.unlock();
-    }
+    signalWriter();
   }
 
   @Override
@@ -227,32 +221,30 @@ public class MonitorLogWriter implements Runnable {
     if (!started.compareAndSet(false, true)) {
       throw new IllegalStateException("MonitorLogWriter can only be run once.");
     }
+    Thread currentThread = Thread.currentThread();
+    writerThread.set(currentThread);
 
     try {
       while (true) {
-        awaitBatchOrShutdown();
-        if (shutdownRequested.get()) {
-          drainQueue();
-          return;
+        acknowledgeWakeup();
+        if (Thread.interrupted()) {
+          accepting.set(false);
         }
-        boolean completeBatchReady = isBatchReady();
-        int maximumCount = completeBatchReady ? fixedBatchSize() : monitorQueue.size();
-        processLogs(maximumCount);
-        flushBatch();
-        resetPendingTimer();
-      }
-    } finally {
-      preprocessingExecutor.shutdownNow();
-      flushBatch();
-    }
-  }
 
-  private void awaitBatchOrShutdown() {
-    lifecycleLock.lock();
-    try {
-      while (!shutdownRequested.get()) {
+        if (!accepting.get()) {
+          drainQueue();
+          if (canTerminate()) {
+            return;
+          }
+          parkUntilSignal();
+          continue;
+        }
+
         if (isBatchReady()) {
-          return;
+          processLogs(fixedBatchSize());
+          flushBatch();
+          resetPendingTimer();
+          continue;
         }
 
         if (monitorQueue.isEmpty()) {
@@ -262,36 +254,28 @@ public class MonitorLogWriter implements Runnable {
           long elapsedNanos = System.nanoTime() - pendingSinceNanos;
           long remainingNanos = flushTimeoutNanos - elapsedNanos;
           if (remainingNanos <= 0) {
-            return;
+            processLogs(monitorQueue.size());
+            flushBatch();
+            resetPendingTimer();
+            continue;
           }
-          try {
-            workAvailable.awaitNanos(remainingNanos);
-          } catch (InterruptedException e) {
-            requestShutdownAfterInterrupt();
-            return;
-          }
+          parkUntilSignal(remainingNanos);
           continue;
         }
 
-        try {
-          workAvailable.await();
-        } catch (InterruptedException e) {
-          requestShutdownAfterInterrupt();
-          return;
-        }
+        parkUntilSignal();
       }
     } finally {
-      lifecycleLock.unlock();
+      accepting.set(false);
+      writerThread.compareAndSet(currentThread, null);
+      preprocessingExecutor.shutdownNow();
+      flushBatch();
     }
   }
 
   private boolean isBatchReady() {
     return batchPolicy instanceof BatchPolicy.FixedSize fixedSize
         && monitorQueue.size() >= fixedSize.size();
-  }
-
-  private boolean shouldSignalForCurrentQueue() {
-    return isBatchReady() || (flushTimeoutNanos > 0 && !monitorQueue.isEmpty());
   }
 
   private void markPendingIfNeeded() {
@@ -303,17 +287,38 @@ public class MonitorLogWriter implements Runnable {
   }
 
   private void resetPendingTimer() {
-    lifecycleLock.lock();
-    try {
-      pendingSinceNanos = monitorQueue.isEmpty() ? Long.MIN_VALUE : System.nanoTime();
-    } finally {
-      lifecycleLock.unlock();
+    pendingSinceNanos = monitorQueue.isEmpty() ? Long.MIN_VALUE : System.nanoTime();
+  }
+
+  private boolean canTerminate() {
+    return !accepting.get()
+        && inFlightSubmissions.get() == 0
+        && monitorQueue.isEmpty();
+  }
+
+  private void acknowledgeWakeup() {
+    wakeupRequested.set(false);
+  }
+
+  private void signalWriter() {
+    if (wakeupRequested.compareAndSet(false, true)) {
+      Thread thread = writerThread.get();
+      if (thread != null) {
+        LockSupport.unpark(thread);
+      }
     }
   }
 
-  private void requestShutdownAfterInterrupt() {
-    shutdownRequested.set(true);
-    Thread.currentThread().interrupt();
+  private void parkUntilSignal() {
+    if (!wakeupRequested.get()) {
+      LockSupport.park(this);
+    }
+  }
+
+  private void parkUntilSignal(long timeoutNanos) {
+    if (!wakeupRequested.get()) {
+      LockSupport.parkNanos(this, timeoutNanos);
+    }
   }
 
   private void drainQueue() {
@@ -363,7 +368,7 @@ public class MonitorLogWriter implements Runnable {
           return true;
         } catch (InterruptedException e) {
           interrupted = true;
-          shutdownRequested.set(true);
+          accepting.set(false);
         } catch (ExecutionException e) {
           errorHandler.handle(log, e.getCause());
           return false;

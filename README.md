@@ -48,6 +48,10 @@ writer.notifyIfNeeded();
 Call `notifyIfNeeded()` after every direct enqueue. This is also required for an incomplete batch to
 start its timeout.
 
+`submit()` does not acquire a shared exclusive lock. It registers the call as in flight, checks that
+the writer is accepting data, performs the concurrent-queue enqueue, and wakes the writer with
+`LockSupport.unpark()`. Concurrent producer signals are coalesced into a single pending wake-up.
+
 ## Writer batching and lifecycle
 
 `MonitorLogWriter` is a one-shot `Runnable`: create one writer for one writer thread and do not call
@@ -78,6 +82,10 @@ translate a negative batch size to `unbounded()` and `Duration.ZERO` to `disable
 
 On shutdown, the writer wakes automatically, stops accepting `submit()` calls, drains queued logs,
 flushes the strategy, and terminates. The caller still owns the writer thread and must `join()` it.
+Submissions that had already passed the acceptance check are counted as in flight, so shutdown does
+not terminate the writer until those submissions finish and their logs have been drained. Direct
+calls to `MonitorQueue.enqueue()` bypass this lifecycle guarantee; prefer `submit()` when producers
+can race with shutdown.
 
 ## Preprocessing workers and errors
 
