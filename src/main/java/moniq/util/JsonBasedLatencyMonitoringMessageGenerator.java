@@ -7,12 +7,23 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class JsonBasedLatencyMonitoringMessageGenerator
     extends JsonBasedLatencyMonitoringMessageAdaptor {
 
-  private static final String PAYLOAD_CHARACTERS =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-
   private final int payloadSize;
-  private final String preGeneratedPayload;
-  private final AtomicInteger currentIndex = new AtomicInteger();
+  private final IPayloadGenerator payloadGenerator;
+
+  /**
+   * Creates a generator with a payload of {@code payloadSize} Java characters. The complete JSON
+   * message length varies with its metadata and JSON escaping.
+   *
+   * @param payloadSize number of alphanumeric payload characters
+   * @param payloadGenerator payload generator
+   */
+  public JsonBasedLatencyMonitoringMessageGenerator(int payloadSize, IPayloadGenerator payloadGenerator) {
+    if (payloadSize < 0) {
+      throw new IllegalArgumentException("payloadSize must not be negative");
+    }
+    this.payloadSize = payloadSize;
+    this.payloadGenerator = payloadGenerator;
+  }
 
   /**
    * Creates a generator with a payload of {@code payloadSize} Java characters. The complete JSON
@@ -21,25 +32,9 @@ public class JsonBasedLatencyMonitoringMessageGenerator
    * @param payloadSize number of alphanumeric payload characters
    * @param preIndicesSize minimum size of the reusable random-character pool
    */
+  @Deprecated
   public JsonBasedLatencyMonitoringMessageGenerator(int payloadSize, int preIndicesSize) {
-    if (payloadSize < 0) {
-      throw new IllegalArgumentException("payloadSize must not be negative");
-    }
-    if (preIndicesSize < 0) {
-      throw new IllegalArgumentException("preIndicesSize must not be negative");
-    }
-    this.payloadSize = payloadSize;
-    this.preGeneratedPayload = generatePayloadPool(preIndicesSize);
-  }
-
-  private String generatePayloadPool(int preIndicesSize) {
-    int poolSize = Math.max(preIndicesSize, payloadSize);
-    StringBuilder payload = new StringBuilder(poolSize);
-    for (int i = 0; i < poolSize; i++) {
-      int randomIndex = ThreadLocalRandom.current().nextInt(PAYLOAD_CHARACTERS.length());
-      payload.append(PAYLOAD_CHARACTERS.charAt(randomIndex));
-    }
-    return payload.toString();
+    this(payloadSize, new BasicRandomPayloadGenerator(Math.min(payloadSize, preIndicesSize)));
   }
 
   @Override
@@ -47,8 +42,6 @@ public class JsonBasedLatencyMonitoringMessageGenerator
     if (payloadSize == 0) {
       return "";
     }
-    int windowCount = preGeneratedPayload.length() - payloadSize + 1;
-    int startIndex = Math.floorMod(currentIndex.getAndIncrement(), windowCount);
-    return preGeneratedPayload.substring(startIndex, startIndex + payloadSize);
+    return payloadGenerator.generatePayload(payloadSize);
   }
 }
