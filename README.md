@@ -87,20 +87,24 @@ writer.submit(log);
 boolean committed = writer.flush();
 ```
 
-`flush()` returns only after preprocessing, ordered writes, and the strategy's `commit()` finish;
-its return value is the result from `commit()`. An empty flush returns `true` without committing.
-Afterward, the next queued log begins a new batch and a new timeout period. A file strategy's
-roll-out age and record count are independent and remain unchanged. To create an explicit file
-boundary, flush the writer first and then roll out the strategy:
+`flush()` inserts a FIFO boundary into the writer queue and returns only after every log before that
+boundary finishes preprocessing, ordered writes, and the strategy's `commit()`. Its return value is
+`false` if any commit from the preceding boundary to this one fails; a boundary with no preceding
+writes returns `true` without committing.
+Logs submitted after the boundary remain for the next batch. Concurrent `submit()` and `flush()`
+calls are ordered by their lock-free queue insertion, so calls that overlap may fall on either side
+of the boundary. Afterward, the next queued log begins a new batch and a new timeout period. A file
+strategy's roll-out age and record count are independent and remain unchanged. To create an explicit
+file boundary, flush the writer first and then roll out the strategy:
 
 ```java
 writer.flush();
 fileStrategy.rollOut();
 ```
 
-Concurrent flush calls may be fulfilled by the same commit. Calling `flush()` after shutdown starts
-throws `IllegalStateException`; interruption while waiting throws `InterruptedException`, but the
-accepted flush request still runs.
+Each flush keeps its own FIFO boundary. Calling `flush()` after shutdown starts throws
+`IllegalStateException`; interruption while waiting throws `InterruptedException`, but the accepted
+flush request still runs.
 
 On shutdown, the writer wakes automatically, stops accepting `submit()` calls, drains queued logs,
 flushes the strategy, and terminates. The caller still owns the writer thread and must `join()` it.

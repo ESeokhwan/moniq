@@ -72,6 +72,33 @@ class MonitorLogWriterFlushTest {
   }
 
   @Test
+  void returnsFailureFromABatchThatWasAlreadyProcessingBeforeTheBoundary() throws Exception {
+    RecordingStrategy strategy = new RecordingStrategy(false);
+    RunningWriter running = startWriter(strategy, BatchPolicy.fixedSize(1), FlushPolicy.disabled());
+    CountDownLatch preprocessingStarted = new CountDownLatch(1);
+    CountDownLatch releasePreprocessing = new CountDownLatch(1);
+    ExecutorService caller = Executors.newSingleThreadExecutor();
+
+    try {
+      running.writer.submit(
+          new BlockingLog("before", preprocessingStarted, releasePreprocessing));
+      assertTrue(preprocessingStarted.await(2, TimeUnit.SECONDS));
+
+      Future<Boolean> flushResult = caller.submit(running.writer::flush);
+      assertTrue(running.awaitQueueSize(1, 2, TimeUnit.SECONDS));
+      releasePreprocessing.countDown();
+
+      assertFalse(flushResult.get(2, TimeUnit.SECONDS));
+      assertEquals(List.of("before"), strategy.writtenIds);
+      assertEquals(1, strategy.commitCount.get());
+    } finally {
+      releasePreprocessing.countDown();
+      caller.shutdownNow();
+      running.stop();
+    }
+  }
+
+  @Test
   void startsANewBatchAfterForcedFlush() throws Exception {
     RecordingStrategy strategy = new RecordingStrategy(true);
     RunningWriter running = startWriter(strategy, BatchPolicy.fixedSize(2), FlushPolicy.disabled());
@@ -141,7 +168,77 @@ class MonitorLogWriterFlushTest {
   }
 
   @Test
-  void coalescesConcurrentFlushRequestsWithoutLosingCallers() throws Exception {
+  void leavesLogsSubmittedAfterTheFlushBoundaryForTheNextBatch() throws Exception {
+    RecordingStrategy strategy = new RecordingStrategy(true);
+    RunningWriter running = startWriter(strategy, BatchPolicy.fixedSize(10), FlushPolicy.disabled());
+    CountDownLatch preprocessingStarted = new CountDownLatch(1);
+    CountDownLatch releasePreprocessing = new CountDownLatch(1);
+    ExecutorService caller = Executors.newSingleThreadExecutor();
+
+    try {
+      running.writer.submit(
+          new BlockingLog("before", preprocessingStarted, releasePreprocessing));
+      Future<Boolean> firstFlush = caller.submit(running.writer::flush);
+
+      // The writer dequeues the marker before it starts preprocessing the preceding record.
+      assertTrue(preprocessingStarted.await(2, TimeUnit.SECONDS));
+      running.writer.submit(log("after"));
+      releasePreprocessing.countDown();
+
+      assertTrue(firstFlush.get(2, TimeUnit.SECONDS));
+      assertEquals(List.of("before"), strategy.writtenIds);
+      assertEquals(1, strategy.commitCount.get());
+      assertEquals(1, running.queue.size());
+
+      assertTrue(running.writer.flush());
+      assertEquals(List.of("before", "after"), strategy.writtenIds);
+      assertEquals(2, strategy.commitCount.get());
+    } finally {
+      releasePreprocessing.countDown();
+      caller.shutdownNow();
+      running.stop();
+    }
+  }
+
+  @Test
+  void preservesEachFlushBoundaryInFifoOrder() throws Exception {
+    CountDownLatch secondWriteStarted = new CountDownLatch(1);
+    CountDownLatch releaseSecondWrite = new CountDownLatch(1);
+    BlockingSecondWriteStrategy strategy =
+        new BlockingSecondWriteStrategy(secondWriteStarted, releaseSecondWrite);
+    RunningWriter running = startWriter(strategy, BatchPolicy.fixedSize(10), FlushPolicy.disabled());
+    CountDownLatch preprocessingStarted = new CountDownLatch(1);
+    CountDownLatch releasePreprocessing = new CountDownLatch(1);
+    ExecutorService callers = Executors.newFixedThreadPool(2);
+
+    try {
+      running.writer.submit(
+          new BlockingLog("first", preprocessingStarted, releasePreprocessing));
+      Future<Boolean> firstFlush = callers.submit(running.writer::flush);
+      assertTrue(preprocessingStarted.await(2, TimeUnit.SECONDS));
+      running.writer.submit(log("second"));
+      Future<Boolean> secondFlush = callers.submit(running.writer::flush);
+
+      releasePreprocessing.countDown();
+      assertTrue(secondWriteStarted.await(2, TimeUnit.SECONDS));
+      assertTrue(firstFlush.get(2, TimeUnit.SECONDS));
+      assertEquals(List.of("first"), strategy.writtenIds);
+      assertEquals(1, strategy.commitCount.get());
+
+      releaseSecondWrite.countDown();
+      assertTrue(secondFlush.get(2, TimeUnit.SECONDS));
+      assertEquals(List.of("first", "second"), strategy.writtenIds);
+      assertEquals(2, strategy.commitCount.get());
+    } finally {
+      releasePreprocessing.countDown();
+      releaseSecondWrite.countDown();
+      callers.shutdownNow();
+      running.stop();
+    }
+  }
+
+  @Test
+  void completesConcurrentFlushRequestsWithoutLosingCallers() throws Exception {
     RecordingStrategy strategy = new RecordingStrategy(true);
     RunningWriter running = startWriter(strategy, BatchPolicy.fixedSize(100), FlushPolicy.disabled());
     ExecutorService callers = Executors.newFixedThreadPool(8);
@@ -261,11 +358,23 @@ class MonitorLogWriterFlushTest {
       thread.join(Duration.ofSeconds(2).toMillis());
       assertFalse(thread.isAlive());
     }
+
+    private boolean awaitQueueSize(int expected, long timeout, TimeUnit unit)
+        throws InterruptedException {
+      long deadline = System.nanoTime() + unit.toNanos(timeout);
+      while (queue.size() != expected) {
+        if (System.nanoTime() >= deadline) {
+          return false;
+        }
+        TimeUnit.MILLISECONDS.sleep(1);
+      }
+      return true;
+    }
   }
 
-  private static final class RecordingStrategy implements IMonitorLogWriteStrategy {
-    private final List<String> writtenIds = Collections.synchronizedList(new ArrayList<>());
-    private final AtomicInteger commitCount = new AtomicInteger();
+  private static class RecordingStrategy implements IMonitorLogWriteStrategy {
+    protected final List<String> writtenIds = Collections.synchronizedList(new ArrayList<>());
+    protected final AtomicInteger commitCount = new AtomicInteger();
     private final boolean commitResult;
     private final Object commitMonitor = new Object();
 
@@ -300,6 +409,32 @@ class MonitorLogWriterFlushTest {
         }
       }
       return true;
+    }
+  }
+
+  private static final class BlockingSecondWriteStrategy extends RecordingStrategy {
+    private final CountDownLatch secondWriteStarted;
+    private final CountDownLatch releaseSecondWrite;
+
+    private BlockingSecondWriteStrategy(
+        CountDownLatch secondWriteStarted, CountDownLatch releaseSecondWrite) {
+      super(true);
+      this.secondWriteStarted = secondWriteStarted;
+      this.releaseSecondWrite = releaseSecondWrite;
+    }
+
+    @Override
+    public void write(IMonitorLog log) {
+      if ("second".equals(log.getValues().get(1))) {
+        secondWriteStarted.countDown();
+        try {
+          releaseSecondWrite.await();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new RuntimeException(e);
+        }
+      }
+      super.write(log);
     }
   }
 

@@ -1,12 +1,11 @@
 package moniq.writer;
 
 import java.time.Duration;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -44,11 +43,14 @@ public class MonitorLogWriter implements Runnable {
   private final AtomicBoolean wakeupRequested = new AtomicBoolean();
   private final AtomicReference<Thread> writerThread = new AtomicReference<>();
   private final AtomicReference<Thread> legacyWaiter = new AtomicReference<>();
-  private final Object flushRequestLock = new Object();
-  private final Queue<CompletableFuture<Boolean>> flushRequests = new ArrayDeque<>();
+  private final Object flushLifecycleLock = new Object();
+  private final ConcurrentLinkedQueue<FlushBoundary> outstandingFlushBoundaries =
+      new ConcurrentLinkedQueue<>();
+  private final AtomicInteger pendingFlushBoundaries = new AtomicInteger();
 
   private long pendingSinceNanos = Long.MIN_VALUE;
   private boolean hasUncommittedWrites;
+  private boolean commitsSinceLastFlushBoundarySucceeded = true;
 
   /**
    * @deprecated Use {@link #MonitorLogWriter(MonitorQueue, IMonitorLogWriteStrategy, BatchPolicy)}.
@@ -183,15 +185,16 @@ public class MonitorLogWriter implements Runnable {
   }
 
   /**
-   * Immediately processes all currently queued logs and waits for the strategy commit to finish.
+   * Immediately processes logs before its FIFO boundary and waits for the strategy commit to finish.
    *
    * <p>This bypasses the configured batch and timeout conditions. After the flush, a new batch and
    * timeout period start with the next pending log. Write-strategy-specific state, such as file
    * roll-out age and record count, is not reset.
    *
-   * <p>Calls may be coalesced when multiple threads request a flush before the writer handles them.
-   * If this thread is interrupted while waiting, the flush request remains valid and will still be
-   * handled by the writer.
+   * <p>A flush inserts an internal FIFO boundary in the log queue. Logs submitted before that
+   * boundary are included; logs submitted after it remain for the next batch. Concurrent submit and
+   * flush calls are ordered by their queue insertion. If this thread is interrupted while waiting,
+   * the flush request remains valid and will still be handled by the writer.
    *
    * @return the result returned by {@link IMonitorLogWriteStrategy#commit()}, or {@code true} when
    *     there were no uncommitted writes
@@ -204,17 +207,25 @@ public class MonitorLogWriter implements Runnable {
       throw new IllegalStateException("The writer thread cannot wait for its own flush.");
     }
 
-    CompletableFuture<Boolean> request = new CompletableFuture<>();
-    synchronized (flushRequestLock) {
+    FlushBoundary boundary = new FlushBoundary();
+    synchronized (flushLifecycleLock) {
       if (!accepting.get()) {
         throw new IllegalStateException("MonitorLogWriter is shutting down.");
       }
-      flushRequests.add(request);
+      outstandingFlushBoundaries.add(boundary);
+      try {
+        monitorQueue.enqueue(boundary);
+      } catch (RuntimeException | Error error) {
+        outstandingFlushBoundaries.remove(boundary);
+        boundary.completion.completeExceptionally(error);
+        throw error;
+      }
+      pendingFlushBoundaries.incrementAndGet();
     }
     signalWriter();
 
     try {
-      return request.get();
+      return boundary.completion.get();
     } catch (ExecutionException e) {
       throw propagateFlushFailure(e.getCause());
     }
@@ -274,9 +285,9 @@ public class MonitorLogWriter implements Runnable {
           stopAccepting();
         }
 
-        List<CompletableFuture<Boolean>> requestedFlushes = takeFlushRequests();
-        if (!requestedFlushes.isEmpty()) {
-          processForcedFlush(requestedFlushes);
+        if (pendingFlushBoundaries.get() > 0) {
+          processAndCommit(Integer.MAX_VALUE);
+          resetPendingTimer();
           continue;
         }
 
@@ -290,8 +301,7 @@ public class MonitorLogWriter implements Runnable {
         }
 
         if (isBatchReady()) {
-          processLogs(fixedBatchSize());
-          flushBatch();
+          processAndCommit(fixedBatchSize());
           resetPendingTimer();
           continue;
         }
@@ -303,8 +313,7 @@ public class MonitorLogWriter implements Runnable {
           long elapsedNanos = System.nanoTime() - pendingSinceNanos;
           long remainingNanos = flushTimeoutNanos - elapsedNanos;
           if (remainingNanos <= 0) {
-            processLogs(monitorQueue.size());
-            flushBatch();
+            processAndCommit(monitorQueue.size());
             resetPendingTimer();
             continue;
           }
@@ -321,7 +330,7 @@ public class MonitorLogWriter implements Runnable {
       try {
         flushBatch();
       } finally {
-        failPendingFlushRequests(
+        failOutstandingFlushBoundaries(
             new IllegalStateException("MonitorLogWriter stopped before completing the flush."));
       }
     }
@@ -347,12 +356,11 @@ public class MonitorLogWriter implements Runnable {
   private boolean canTerminate() {
     return !accepting.get()
         && inFlightSubmissions.get() == 0
-        && monitorQueue.isEmpty()
-        && !hasPendingFlushRequests();
+        && monitorQueue.isEmpty();
   }
 
   private void stopAccepting() {
-    synchronized (flushRequestLock) {
+    synchronized (flushLifecycleLock) {
       accepting.set(false);
     }
   }
@@ -384,39 +392,49 @@ public class MonitorLogWriter implements Runnable {
 
   private void drainQueue() {
     while (!monitorQueue.isEmpty()) {
-      processLogs(
+      processAndCommit(
           batchPolicy instanceof BatchPolicy.FixedSize ? fixedBatchSize() : Integer.MAX_VALUE);
-      flushBatch();
     }
   }
 
-  private void processLogs(int maximumCount) {
+  private FlushBoundary processLogs(int maximumCount) {
     int initialCapacity = Math.max(0, Math.min(maximumCount, monitorQueue.size()));
     List<IMonitorLog> logs = new ArrayList<>(initialCapacity);
+    FlushBoundary boundary = null;
     while (logs.size() < maximumCount) {
       IMonitorLog log = monitorQueue.dequeue();
       if (log == null) {
         break;
       }
+      if (log instanceof FlushBoundary flushBoundary) {
+        boundary = flushBoundary;
+        break;
+      }
       logs.add(log);
     }
 
-    List<Future<?>> preprocessingResults = new ArrayList<>(logs.size());
-    for (IMonitorLog log : logs) {
-      preprocessingResults.add(preprocessingExecutor.submit(log::preprocess));
-    }
+    try {
+      List<Future<?>> preprocessingResults = new ArrayList<>(logs.size());
+      for (IMonitorLog log : logs) {
+        preprocessingResults.add(preprocessingExecutor.submit(log::preprocess));
+      }
 
-    for (int i = 0; i < logs.size(); i++) {
-      IMonitorLog log = logs.get(i);
-      boolean preprocessed = awaitPreprocessing(log, preprocessingResults.get(i));
-      if (preprocessed) {
-        try {
-          writeStrategy.write(log);
-          hasUncommittedWrites = true;
-        } catch (Throwable error) {
-          errorHandler.handle(log, error);
+      for (int i = 0; i < logs.size(); i++) {
+        IMonitorLog log = logs.get(i);
+        boolean preprocessed = awaitPreprocessing(log, preprocessingResults.get(i));
+        if (preprocessed) {
+          try {
+            writeStrategy.write(log);
+            hasUncommittedWrites = true;
+          } catch (Throwable error) {
+            errorHandler.handle(log, error);
+          }
         }
       }
+      return boundary;
+    } catch (RuntimeException | Error error) {
+      failFlushBoundary(boundary, error);
+      throw error;
     }
   }
 
@@ -429,7 +447,7 @@ public class MonitorLogWriter implements Runnable {
           return true;
         } catch (InterruptedException e) {
           interrupted = true;
-          accepting.set(false);
+          stopAccepting();
         } catch (ExecutionException e) {
           errorHandler.handle(log, e.getCause());
           return false;
@@ -451,37 +469,66 @@ public class MonitorLogWriter implements Runnable {
     return true;
   }
 
-  private void processForcedFlush(List<CompletableFuture<Boolean>> requests) {
+  private boolean processAndCommit(int maximumCount) {
+    FlushBoundary boundary = processLogs(maximumCount);
     try {
-      processLogs(Integer.MAX_VALUE);
       boolean committed = flushBatch();
-      resetPendingTimer();
-      requests.forEach(request -> request.complete(committed));
+      if (boundary == null) {
+        recordCommitResultForPendingFlushBoundary(committed);
+      } else {
+        completeFlushBoundary(boundary, consumeCommitResultForFlushBoundary(committed));
+      }
+      return committed;
     } catch (RuntimeException | Error error) {
-      requests.forEach(request -> request.completeExceptionally(error));
+      failFlushBoundary(boundary, error);
       throw error;
     }
   }
 
-  private List<CompletableFuture<Boolean>> takeFlushRequests() {
-    synchronized (flushRequestLock) {
-      List<CompletableFuture<Boolean>> requests = new ArrayList<>(flushRequests.size());
-      CompletableFuture<Boolean> request;
-      while ((request = flushRequests.poll()) != null) {
-        requests.add(request);
+  private void recordCommitResultForPendingFlushBoundary(boolean committed) {
+    if (pendingFlushBoundaries.get() > 0) {
+      commitsSinceLastFlushBoundarySucceeded &= committed;
+    }
+  }
+
+  private boolean consumeCommitResultForFlushBoundary(boolean committed) {
+    boolean boundaryCommitted = commitsSinceLastFlushBoundarySucceeded && committed;
+    commitsSinceLastFlushBoundarySucceeded = true;
+    return boundaryCommitted;
+  }
+
+  private void completeFlushBoundary(FlushBoundary boundary, boolean committed) {
+    if (boundary == null) {
+      return;
+    }
+    synchronized (flushLifecycleLock) {
+      if (outstandingFlushBoundaries.remove(boundary)) {
+        pendingFlushBoundaries.decrementAndGet();
+        boundary.completion.complete(committed);
       }
-      return requests;
     }
   }
 
-  private boolean hasPendingFlushRequests() {
-    synchronized (flushRequestLock) {
-      return !flushRequests.isEmpty();
+  private void failFlushBoundary(FlushBoundary boundary, Throwable error) {
+    if (boundary == null) {
+      return;
+    }
+    synchronized (flushLifecycleLock) {
+      if (outstandingFlushBoundaries.remove(boundary)) {
+        pendingFlushBoundaries.decrementAndGet();
+        boundary.completion.completeExceptionally(error);
+      }
     }
   }
 
-  private void failPendingFlushRequests(Throwable error) {
-    takeFlushRequests().forEach(request -> request.completeExceptionally(error));
+  private void failOutstandingFlushBoundaries(Throwable error) {
+    synchronized (flushLifecycleLock) {
+      FlushBoundary boundary;
+      while ((boundary = outstandingFlushBoundaries.poll()) != null) {
+        pendingFlushBoundaries.decrementAndGet();
+        boundary.completion.completeExceptionally(error);
+      }
+    }
   }
 
   private static RuntimeException propagateFlushFailure(Throwable error) {
@@ -492,6 +539,25 @@ public class MonitorLogWriter implements Runnable {
       throw fatalError;
     }
     return new IllegalStateException("MonitorLogWriter flush failed.", error);
+  }
+
+  private static final class FlushBoundary implements IMonitorLog {
+    private final CompletableFuture<Boolean> completion = new CompletableFuture<>();
+
+    @Override
+    public void preprocess() {
+      throw new AssertionError("Flush boundary must not be preprocessed.");
+    }
+
+    @Override
+    public List<String> getHeaders() {
+      throw new AssertionError("Flush boundary must not be written.");
+    }
+
+    @Override
+    public List<String> getValues() {
+      throw new AssertionError("Flush boundary must not be written.");
+    }
   }
 
   private int fixedBatchSize() {
