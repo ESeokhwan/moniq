@@ -203,11 +203,33 @@ public class MonitorLogWriter implements Runnable {
    *     is called by the writer thread
    */
   public boolean flush() throws InterruptedException {
+    return awaitFlushBoundary(null);
+  }
+
+  /**
+   * Flushes logs before a FIFO boundary, then runs {@code action} on the writer thread.
+   *
+   * <p>Use this for small write-strategy lifecycle actions that must not race with {@code write()}
+   * or {@code commit()}, such as {@code writer.flushAndRun(file.rollOutAction())}. The action runs
+   * after {@code commit()} has returned, including when it returns {@code false}. It does not run
+   * when {@code commit()} throws. A runtime exception from the action is rethrown to this caller;
+   * the writer remains available for later batches.
+   *
+   * @return the commit result for logs before this boundary
+   * @throws InterruptedException if the calling thread is interrupted while waiting
+   * @throws IllegalStateException if shutdown has started, the writer has stopped, or this method
+   *     is called by the writer thread
+   */
+  public boolean flushAndRun(Runnable action) throws InterruptedException {
+    return awaitFlushBoundary(Objects.requireNonNull(action, "action must not be null"));
+  }
+
+  private boolean awaitFlushBoundary(Runnable afterCommit) throws InterruptedException {
     if (Thread.currentThread() == writerThread.get()) {
       throw new IllegalStateException("The writer thread cannot wait for its own flush.");
     }
 
-    FlushBoundary boundary = new FlushBoundary();
+    FlushBoundary boundary = new FlushBoundary(afterCommit);
     synchronized (flushLifecycleLock) {
       if (!accepting.get()) {
         throw new IllegalStateException("MonitorLogWriter is shutting down.");
@@ -476,12 +498,28 @@ public class MonitorLogWriter implements Runnable {
       if (boundary == null) {
         recordCommitResultForPendingFlushBoundary(committed);
       } else {
-        completeFlushBoundary(boundary, consumeCommitResultForFlushBoundary(committed));
+        boolean boundaryCommitted = consumeCommitResultForFlushBoundary(committed);
+        if (runAfterCommitAction(boundary)) {
+          completeFlushBoundary(boundary, boundaryCommitted);
+        }
       }
       return committed;
     } catch (RuntimeException | Error error) {
       failFlushBoundary(boundary, error);
       throw error;
+    }
+  }
+
+  private boolean runAfterCommitAction(FlushBoundary boundary) {
+    if (boundary.afterCommit == null) {
+      return true;
+    }
+    try {
+      boundary.afterCommit.run();
+      return true;
+    } catch (RuntimeException error) {
+      failFlushBoundary(boundary, error);
+      return false;
     }
   }
 
@@ -543,6 +581,11 @@ public class MonitorLogWriter implements Runnable {
 
   private static final class FlushBoundary implements IMonitorLog {
     private final CompletableFuture<Boolean> completion = new CompletableFuture<>();
+    private final Runnable afterCommit;
+
+    private FlushBoundary(Runnable afterCommit) {
+      this.afterCommit = afterCommit;
+    }
 
     @Override
     public void preprocess() {

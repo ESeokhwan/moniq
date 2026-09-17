@@ -16,8 +16,8 @@ import moniq.IMonitorLog;
  * Its result is {@code true} only when every child commits successfully. Runtime commit failures
  * are reported after the remaining children have been given a chance to commit.
  *
- * <p>The normal {@code MonitorLogWriter} calls this strategy from one writer thread. Calls made
- * through this composite are serialized; do not concurrently use a child strategy directly.
+ * <p>The normal {@code MonitorLogWriter} calls this strategy from one writer thread. Do not invoke
+ * this strategy or any child strategy concurrently; close it after the writer has stopped.
  */
 public final class CompositeMonitorLogWriteStrategy
     implements IMonitorLogWriteStrategy, AutoCloseable {
@@ -48,7 +48,7 @@ public final class CompositeMonitorLogWriteStrategy
   }
 
   @Override
-  public synchronized void write(IMonitorLog log) {
+  public void write(IMonitorLog log) {
     ensureOpen();
     Objects.requireNonNull(log, "log must not be null");
     for (int i = 0; i < strategies.size(); i++) {
@@ -62,7 +62,7 @@ public final class CompositeMonitorLogWriteStrategy
   }
 
   @Override
-  public synchronized boolean commit() {
+  public boolean commit() {
     ensureOpen();
     boolean committed = true;
     RuntimeException failure = null;
@@ -90,7 +90,7 @@ public final class CompositeMonitorLogWriteStrategy
    * <p>The caller must close the composite only after its {@code MonitorLogWriter} has stopped.
    */
   @Override
-  public synchronized void close() {
+  public void close() {
     if (closed) {
       return;
     }

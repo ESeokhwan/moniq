@@ -95,11 +95,11 @@ Logs submitted after the boundary remain for the next batch. Concurrent `submit(
 calls are ordered by their lock-free queue insertion, so calls that overlap may fall on either side
 of the boundary. Afterward, the next queued log begins a new batch and a new timeout period. A file
 strategy's roll-out age and record count are independent and remain unchanged. To create an explicit
-file boundary, flush the writer first and then roll out the strategy:
+file boundary, use `flushAndRun()` so the roll-out runs on the writer thread immediately after its
+commit:
 
 ```java
-writer.flush();
-fileStrategy.rollOut();
+writer.flushAndRun(fileStrategy.rollOutAction());
 ```
 
 Each flush keeps its own FIFO boundary. Calling `flush()` after shutdown starts throws
@@ -243,7 +243,7 @@ try (CompositeMonitorLogWriteStrategy strategy = new CompositeMonitorLogWriteStr
   MonitorLogWriter writer = new MonitorLogWriter(
       new MonitorQueue(), strategy, BatchPolicy.fixedSize(1_000));
   // Start, submit to, gracefully shut down, and join writer before closing strategy.
-  // For a manual file boundary: writer.flush(); file.rollOut();
+  // For a manual file boundary: writer.flushAndRun(file.rollOutAction());
 }
 ```
 
@@ -265,8 +265,7 @@ try (FileMonitorLogWriteStrategy strategy = new FileMonitorLogWriteStrategy(
   try {
     writer.submit(log);
     // Call from a user-input handler (for example, a console command or UI button).
-    writer.flush();
-    strategy.rollOut();
+    writer.flushAndRun(strategy.rollOutAction());
   } finally {
     writer.gracefulShutdown();
     writerThread.join();
@@ -298,10 +297,11 @@ minutes old or already contains 100,000 logs. Time is measured from the first wr
 using a monotonic clock; idle periods do not create files. `Duration.ZERO` disables the time limit,
 and `0` disables the count limit. The constructor taking only a `Path` enables manual roll-out only.
 
-`rollOut()` flushes and closes the current file immediately; the next `write()` creates the next
-file. It is safe to call from another thread. Already queued but unwritten logs go into the new file;
-the manual boundary applies to writes, not submissions. Repeated requests without intervening writes
-do not create empty files.
+`rollOutAction()` returns the action that flushes and closes the current file; the next `write()`
+creates the next file. Always pass it to `writer.flushAndRun(...)` rather than executing it directly.
+The action's FIFO boundary applies to writes, not submissions, so logs already queued after the
+boundary remain for the new file. Repeated requests without intervening writes do not create empty
+files.
 
 Files are named `monitor.log`, `monitor.1.log`, `monitor.2.log`, and so on. Existing files are skipped
 without overwriting, and missing parent directories are created automatically. Headers in

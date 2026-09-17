@@ -16,7 +16,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import moniq.IMonitorLog;
 import moniq.MonitorLog;
 import moniq.MonitorQueue;
@@ -291,6 +293,81 @@ class MonitorLogWriterFlushTest {
     assertThrows(IllegalStateException.class, running.writer::flush);
     running.thread.join(Duration.ofSeconds(2).toMillis());
     assertFalse(running.thread.isAlive());
+  }
+
+  @Test
+  void flushAndRunExecutesTheActionOnTheWriterThreadAfterACommitAttempt() throws Exception {
+    RecordingStrategy strategy = new RecordingStrategy(false);
+    RunningWriter running = startWriter(strategy, BatchPolicy.fixedSize(10), FlushPolicy.disabled());
+    AtomicBoolean actionRan = new AtomicBoolean();
+    AtomicReference<Thread> actionThread = new AtomicReference<>();
+
+    try {
+      running.writer.submit(log("before"));
+
+      assertFalse(
+          running.writer.flushAndRun(
+              () -> {
+                actionRan.set(true);
+                actionThread.set(Thread.currentThread());
+              }));
+
+      assertTrue(actionRan.get());
+      assertEquals(running.thread, actionThread.get());
+      assertEquals(1, strategy.commitCount.get());
+    } finally {
+      running.stop();
+    }
+  }
+
+  @Test
+  void keepsWritingAfterAFlushAndRunActionFails() throws Exception {
+    RecordingStrategy strategy = new RecordingStrategy(true);
+    RunningWriter running = startWriter(strategy, BatchPolicy.fixedSize(10), FlushPolicy.disabled());
+
+    try {
+      IllegalStateException error =
+          assertThrows(
+              IllegalStateException.class,
+              () ->
+                  running.writer.flushAndRun(
+                      () -> {
+                        throw new IllegalStateException("roll-out failed");
+                      }));
+      assertEquals("roll-out failed", error.getMessage());
+
+      running.writer.submit(log("after-failure"));
+      assertTrue(running.writer.flush());
+      assertEquals(List.of("after-failure"), strategy.writtenIds);
+    } finally {
+      running.stop();
+    }
+  }
+
+  @Test
+  void flushAndRunRollsOutFilesBetweenItsBoundaries(@TempDir Path tempDir) throws Exception {
+    Path output = tempDir.resolve("monitor.log");
+    FileMonitorLogWriteStrategy strategy =
+        new FileMonitorLogWriteStrategy(
+            output, FileMonitorLogWriteStrategy.Format.COMMA_SEPARATED);
+    RunningWriter running = startWriter(strategy, BatchPolicy.fixedSize(100), FlushPolicy.disabled());
+
+    try {
+      running.writer.submit(log("before"));
+      assertTrue(running.writer.flushAndRun(strategy.rollOutAction()));
+      running.writer.submit(log("after"));
+      assertTrue(running.writer.flush());
+    } finally {
+      running.stop();
+      strategy.close();
+    }
+
+    assertEquals(
+        List.of("RequestType,Id,Timestamp,TimestampNano,State", "type,before,1,10,state"),
+        Files.readAllLines(output));
+    assertEquals(
+        List.of("RequestType,Id,Timestamp,TimestampNano,State", "type,after,1,10,state"),
+        Files.readAllLines(tempDir.resolve("monitor.1.log")));
   }
 
   @Test

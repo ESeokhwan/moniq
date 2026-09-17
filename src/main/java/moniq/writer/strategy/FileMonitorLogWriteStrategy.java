@@ -16,7 +16,7 @@ import java.util.stream.Collectors;
 import moniq.IMonitorLog;
 
 /**
- * Writes UTF-8 log files, rolling out on elapsed time, log count, or {@link #rollOut()}.
+ * Writes UTF-8 log files, rolling out on elapsed time, log count, or a manual roll-out action.
  *
  * <p>Automatic limits are checked before each write. A new file is created only when a log is
  * available, so idle periods and repeated manual requests do not create empty files. Comma-separated
@@ -25,8 +25,9 @@ import moniq.IMonitorLog;
  *
  * <p>For {@code monitor.log}, files are named {@code monitor.log}, {@code monitor.1.log}, and so on.
  * Existing names are skipped atomically, including when another strategy uses the same base path.
- * All lifecycle operations are synchronized so a user-input thread can request a roll-out while
- * {@code MonitorLogWriter} writes. The caller must close this strategy after the writer has stopped.
+ * File-mutating operations must run on the writer thread. Request a manual roll-out with {@code
+ * writer.flushAndRun(fileStrategy.rollOutAction())}; close this strategy after the writer has
+ * stopped.
  */
 public final class FileMonitorLogWriteStrategy implements IMonitorLogWriteStrategy, AutoCloseable {
 
@@ -102,7 +103,7 @@ public final class FileMonitorLogWriteStrategy implements IMonitorLogWriteStrate
   }
 
   @Override
-  public synchronized void write(IMonitorLog log) {
+  public void write(IMonitorLog log) {
     ensureOpen();
     Objects.requireNonNull(log, "log must not be null");
     // Resolve the record before changing files, in case deferred log access fails.
@@ -132,7 +133,7 @@ public final class FileMonitorLogWriteStrategy implements IMonitorLogWriteStrate
 
   /** Flushes the current file; returns false if flushing fails. No file is created by a commit. */
   @Override
-  public synchronized boolean commit() {
+  public boolean commit() {
     ensureOpen();
     try {
       if (writer != null) {
@@ -145,10 +146,16 @@ public final class FileMonitorLogWriteStrategy implements IMonitorLogWriteStrate
   }
 
   /**
-   * Flushes and closes the current file. The next write opens a new file and resets both limits.
-   * Can be called directly from a console command, UI event, or other user-input handler.
+   * Returns the manual roll-out action for {@code MonitorLogWriter.flushAndRun(Runnable)}.
+   *
+   * <p>The action flushes and closes the current file. The next write opens a new file and resets
+   * both limits. Do not run it directly or from a user-input thread.
    */
-  public synchronized void rollOut() {
+  public Runnable rollOutAction() {
+    return this::rollOut;
+  }
+
+  private void rollOut() {
     ensureOpen();
     try {
       closeCurrentFile();
@@ -157,9 +164,9 @@ public final class FileMonitorLogWriteStrategy implements IMonitorLogWriteStrate
     }
   }
 
-  /** Flushes and releases the file. Repeated close calls are harmless. */
+  /** Flushes and releases the file after the writer has stopped. Repeated close calls are harmless. */
   @Override
-  public synchronized void close() {
+  public void close() {
     if (closed) {
       return;
     }

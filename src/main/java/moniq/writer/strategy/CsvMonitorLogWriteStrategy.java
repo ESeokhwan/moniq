@@ -19,7 +19,7 @@ public class CsvMonitorLogWriteStrategy implements IMonitorLogWriteStrategy, Aut
   }
 
   @Override
-  public synchronized void write(IMonitorLog log) {
+  public void write(IMonitorLog log) {
     ensureOpen();
     if (writer == null) {
       try {
@@ -42,7 +42,7 @@ public class CsvMonitorLogWriteStrategy implements IMonitorLogWriteStrategy, Aut
   }
 
   @Override
-  public synchronized boolean commit() {
+  public boolean commit() {
     ensureOpen();
     if (writer == null) {
       return true;
@@ -57,7 +57,7 @@ public class CsvMonitorLogWriteStrategy implements IMonitorLogWriteStrategy, Aut
 
   /** Flushes and closes the current CSV file. Repeated calls are harmless. */
   @Override
-  public synchronized void close() {
+  public void close() {
     if (closed) {
       return;
     }

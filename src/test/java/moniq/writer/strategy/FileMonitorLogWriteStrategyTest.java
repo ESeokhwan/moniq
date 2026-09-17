@@ -10,12 +10,7 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import moniq.MonitorLog;
 import org.junit.jupiter.api.Test;
@@ -44,7 +39,7 @@ class FileMonitorLogWriteStrategyTest {
     try (var strategy = new FileMonitorLogWriteStrategy(output, Duration.ZERO, 1)) {
       strategy.write(log(1));
       strategy.write(log(2));
-      strategy.rollOut();
+      strategy.rollOutAction().run();
       strategy.write(log(3));
     }
     for (int id = 1; id <= 3; id++) {
@@ -124,12 +119,12 @@ class FileMonitorLogWriteStrategyTest {
     Path output = tempDir.resolve("monitor.log");
     try (var strategy = new FileMonitorLogWriteStrategy(
         output, Duration.ofSeconds(10), 2, COMMA_SEPARATED, time::get)) {
-      strategy.rollOut();
+      strategy.rollOutAction().run();
       assertTrue(strategy.commit());
       assertFalse(Files.exists(output));
       strategy.write(log(1));
-      strategy.rollOut();
-      strategy.rollOut();
+      strategy.rollOutAction().run();
+      strategy.rollOutAction().run();
       assertEquals(List.of(HEADER, row(1)), Files.readAllLines(output));
       assertFalse(Files.exists(tempDir.resolve("monitor.1.log")));
       time.set(Duration.ofSeconds(9).toNanos());
@@ -150,7 +145,7 @@ class FileMonitorLogWriteStrategyTest {
         var second = new FileMonitorLogWriteStrategy(output, COMMA_SEPARATED)) {
       first.write(log(1));
       second.write(log(2));
-      first.rollOut();
+      first.rollOutAction().run();
       first.write(log(3));
     }
     assertEquals("existing log", Files.readString(output));
@@ -165,7 +160,7 @@ class FileMonitorLogWriteStrategyTest {
     Path output = tempDir.resolve("monitor");
     try (var strategy = new FileMonitorLogWriteStrategy(output, COMMA_SEPARATED)) {
       strategy.write(log(1));
-      strategy.rollOut();
+      strategy.rollOutAction().run();
       strategy.write(log(2));
     }
     assertEquals(List.of(HEADER, row(2)), Files.readAllLines(tempDir.resolve("monitor.1")));
@@ -181,7 +176,7 @@ class FileMonitorLogWriteStrategyTest {
     assertEquals(List.of(HEADER, row(1)), Files.readAllLines(output));
     assertThrows(IllegalStateException.class, () -> strategy.write(log(2)));
     assertThrows(IllegalStateException.class, strategy::commit);
-    assertThrows(IllegalStateException.class, strategy::rollOut);
+    assertThrows(IllegalStateException.class, () -> strategy.rollOutAction().run());
   }
 
   @Test
@@ -200,50 +195,6 @@ class FileMonitorLogWriteStrategyTest {
       assertThrows(UncheckedIOException.class, () -> strategy.write(log(1)));
     }
     assertEquals("occupied", Files.readString(parentFile));
-  }
-
-  @Test
-  void concurrentManualRollOutDoesNotLoseOrDuplicateLogs() throws Exception {
-    var executor = Executors.newFixedThreadPool(2);
-    CountDownLatch start = new CountDownLatch(1);
-    try (var strategy = new FileMonitorLogWriteStrategy(
-        tempDir.resolve("monitor.log"), Duration.ZERO, 7, COMMA_SEPARATED)) {
-      var writing = executor.submit(() -> {
-        start.await();
-        for (int i = 0; i < 200; i++) {
-          strategy.write(log(i));
-        }
-        return null;
-      });
-      var rolling = executor.submit(() -> {
-        start.await();
-        for (int i = 0; i < 200; i++) {
-          strategy.rollOut();
-          assertTrue(strategy.commit());
-        }
-        return null;
-      });
-      start.countDown();
-      writing.get(10, TimeUnit.SECONDS);
-      rolling.get(10, TimeUnit.SECONDS);
-    } finally {
-      executor.shutdownNow();
-    }
-    List<String> actual = new ArrayList<>();
-    try (var files = Files.list(tempDir)) {
-      for (Path file : files.toList()) {
-        List<String> lines = Files.readAllLines(file);
-        assertEquals(HEADER, lines.get(0));
-        assertTrue(lines.size() >= 2 && lines.size() <= 8);
-        actual.addAll(lines.subList(1, lines.size()));
-      }
-    }
-    List<String> expected = new ArrayList<>();
-    for (int i = 0; i < 200; i++) {
-      expected.add(row(i));
-    }
-    assertEquals(expected.size(), actual.size());
-    assertEquals(new HashSet<>(expected), new HashSet<>(actual));
   }
 
   private static MonitorLog log(int id) {
