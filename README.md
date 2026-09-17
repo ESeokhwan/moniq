@@ -80,6 +80,28 @@ FlushPolicy noTimeout = FlushPolicy.disabled();
 The older numeric constructors remain available for source compatibility but are deprecated. They
 translate a negative batch size to `unbounded()` and `Duration.ZERO` to `disabled()`.
 
+Call `flush()` to bypass both policies and synchronously process all currently queued logs:
+
+```java
+writer.submit(log);
+boolean committed = writer.flush();
+```
+
+`flush()` returns only after preprocessing, ordered writes, and the strategy's `commit()` finish;
+its return value is the result from `commit()`. An empty flush returns `true` without committing.
+Afterward, the next queued log begins a new batch and a new timeout period. A file strategy's
+roll-out age and record count are independent and remain unchanged. To create an explicit file
+boundary, flush the writer first and then roll out the strategy:
+
+```java
+writer.flush();
+fileStrategy.rollOut();
+```
+
+Concurrent flush calls may be fulfilled by the same commit. Calling `flush()` after shutdown starts
+throws `IllegalStateException`; interruption while waiting throws `InterruptedException`, but the
+accepted flush request still runs.
+
 On shutdown, the writer wakes automatically, stops accepting `submit()` calls, drains queued logs,
 flushes the strategy, and terminates. The caller still owns the writer thread and must `join()` it.
 Submissions that had already passed the acceptance check are counted as in flight, so shutdown does

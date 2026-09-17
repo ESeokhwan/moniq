@@ -1,9 +1,12 @@
 package moniq.writer;
 
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -41,6 +44,8 @@ public class MonitorLogWriter implements Runnable {
   private final AtomicBoolean wakeupRequested = new AtomicBoolean();
   private final AtomicReference<Thread> writerThread = new AtomicReference<>();
   private final AtomicReference<Thread> legacyWaiter = new AtomicReference<>();
+  private final Object flushRequestLock = new Object();
+  private final Queue<CompletableFuture<Boolean>> flushRequests = new ArrayDeque<>();
 
   private long pendingSinceNanos = Long.MIN_VALUE;
   private boolean hasUncommittedWrites;
@@ -177,9 +182,47 @@ public class MonitorLogWriter implements Runnable {
     }
   }
 
+  /**
+   * Immediately processes all currently queued logs and waits for the strategy commit to finish.
+   *
+   * <p>This bypasses the configured batch and timeout conditions. After the flush, a new batch and
+   * timeout period start with the next pending log. Write-strategy-specific state, such as file
+   * roll-out age and record count, is not reset.
+   *
+   * <p>Calls may be coalesced when multiple threads request a flush before the writer handles them.
+   * If this thread is interrupted while waiting, the flush request remains valid and will still be
+   * handled by the writer.
+   *
+   * @return the result returned by {@link IMonitorLogWriteStrategy#commit()}, or {@code true} when
+   *     there were no uncommitted writes
+   * @throws InterruptedException if the calling thread is interrupted while waiting
+   * @throws IllegalStateException if shutdown has started, the writer has stopped, or this method
+   *     is called by the writer thread
+   */
+  public boolean flush() throws InterruptedException {
+    if (Thread.currentThread() == writerThread.get()) {
+      throw new IllegalStateException("The writer thread cannot wait for its own flush.");
+    }
+
+    CompletableFuture<Boolean> request = new CompletableFuture<>();
+    synchronized (flushRequestLock) {
+      if (!accepting.get()) {
+        throw new IllegalStateException("MonitorLogWriter is shutting down.");
+      }
+      flushRequests.add(request);
+    }
+    signalWriter();
+
+    try {
+      return request.get();
+    } catch (ExecutionException e) {
+      throw propagateFlushFailure(e.getCause());
+    }
+  }
+
   /** Requests shutdown, wakes the writer, and causes all queued logs to be drained. */
   public void gracefulShutdown() {
-    accepting.set(false);
+    stopAccepting();
     signalWriter();
   }
 
@@ -228,7 +271,13 @@ public class MonitorLogWriter implements Runnable {
       while (true) {
         acknowledgeWakeup();
         if (Thread.interrupted()) {
-          accepting.set(false);
+          stopAccepting();
+        }
+
+        List<CompletableFuture<Boolean>> requestedFlushes = takeFlushRequests();
+        if (!requestedFlushes.isEmpty()) {
+          processForcedFlush(requestedFlushes);
+          continue;
         }
 
         if (!accepting.get()) {
@@ -266,10 +315,15 @@ public class MonitorLogWriter implements Runnable {
         parkUntilSignal();
       }
     } finally {
-      accepting.set(false);
+      stopAccepting();
       writerThread.compareAndSet(currentThread, null);
       preprocessingExecutor.shutdownNow();
-      flushBatch();
+      try {
+        flushBatch();
+      } finally {
+        failPendingFlushRequests(
+            new IllegalStateException("MonitorLogWriter stopped before completing the flush."));
+      }
     }
   }
 
@@ -293,7 +347,14 @@ public class MonitorLogWriter implements Runnable {
   private boolean canTerminate() {
     return !accepting.get()
         && inFlightSubmissions.get() == 0
-        && monitorQueue.isEmpty();
+        && monitorQueue.isEmpty()
+        && !hasPendingFlushRequests();
+  }
+
+  private void stopAccepting() {
+    synchronized (flushRequestLock) {
+      accepting.set(false);
+    }
   }
 
   private void acknowledgeWakeup() {
@@ -381,11 +442,56 @@ public class MonitorLogWriter implements Runnable {
     }
   }
 
-  private void flushBatch() {
+  private boolean flushBatch() {
     if (hasUncommittedWrites) {
-      writeStrategy.commit();
+      boolean committed = writeStrategy.commit();
       hasUncommittedWrites = false;
+      return committed;
     }
+    return true;
+  }
+
+  private void processForcedFlush(List<CompletableFuture<Boolean>> requests) {
+    try {
+      processLogs(Integer.MAX_VALUE);
+      boolean committed = flushBatch();
+      resetPendingTimer();
+      requests.forEach(request -> request.complete(committed));
+    } catch (RuntimeException | Error error) {
+      requests.forEach(request -> request.completeExceptionally(error));
+      throw error;
+    }
+  }
+
+  private List<CompletableFuture<Boolean>> takeFlushRequests() {
+    synchronized (flushRequestLock) {
+      List<CompletableFuture<Boolean>> requests = new ArrayList<>(flushRequests.size());
+      CompletableFuture<Boolean> request;
+      while ((request = flushRequests.poll()) != null) {
+        requests.add(request);
+      }
+      return requests;
+    }
+  }
+
+  private boolean hasPendingFlushRequests() {
+    synchronized (flushRequestLock) {
+      return !flushRequests.isEmpty();
+    }
+  }
+
+  private void failPendingFlushRequests(Throwable error) {
+    takeFlushRequests().forEach(request -> request.completeExceptionally(error));
+  }
+
+  private static RuntimeException propagateFlushFailure(Throwable error) {
+    if (error instanceof RuntimeException runtimeException) {
+      return runtimeException;
+    }
+    if (error instanceof Error fatalError) {
+      throw fatalError;
+    }
+    return new IllegalStateException("MonitorLogWriter flush failed.", error);
   }
 
   private int fixedBatchSize() {
