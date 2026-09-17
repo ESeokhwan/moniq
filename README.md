@@ -215,9 +215,71 @@ throws `NotProcessedException`.
 The included strategies are:
 
 - `CsvMonitorLogWriteStrategy` for CSV files;
+- `FileMonitorLogWriteStrategy` for readable or comma-separated UTF-8 log files with roll-out;
 - `ScrapableWriteStrategy` for delimiter-separated output with an optional header;
 - `ReadFriendlyWriteStrategy` for labeled human-readable output;
 - `NoOpWriteStrategy` for measuring monitoring overhead without output.
 
 Custom exporters implement `IMonitorLogWriteStrategy`. `write()` receives preprocessed logs and
 `commit()` is called at flush boundaries.
+
+### Rolling log files
+
+```java
+try (FileMonitorLogWriteStrategy strategy = new FileMonitorLogWriteStrategy(
+    Path.of("logs", "monitor.log"), Duration.ofMinutes(10), 100_000,
+    FileMonitorLogWriteStrategy.Format.READ_FRIENDLY)) {
+  MonitorLogWriter writer = new MonitorLogWriter(
+      new MonitorQueue(), strategy, BatchPolicy.fixedSize(1_000),
+      FlushPolicy.after(Duration.ofSeconds(1)));
+  Thread writerThread = new Thread(writer, "moniq-writer");
+  writerThread.start();
+  try {
+    writer.submit(log);
+    // Call from a user-input handler (for example, a console command or UI button).
+    writer.flush();
+    strategy.rollOut();
+  } finally {
+    writer.gracefulShutdown();
+    writerThread.join();
+  }
+} // Close the strategy after the writer stops to release the file.
+```
+
+Choose one of two formats. `READ_FRIENDLY` is the default and writes labeled values, one log per
+line, without a separate header:
+
+```text
+RequestType: produce, Id: message-1, Timestamp: 1000, TimestampNano: 2000, State: requested
+```
+
+`COMMA_SEPARATED` writes a header in every `.log` file followed by comma-separated records for easy
+CSV conversion:
+
+```text
+RequestType,Id,Timestamp,TimestampNano,State
+produce,message-1,1000,2000,requested
+```
+
+Comma-separated output quotes fields containing commas, quotes, or line breaks, preserving their
+values when read by a CSV parser. Human-readable output escapes backslashes and line breaks so each
+record stays on one line. The file extension comes from the supplied path for either format.
+
+The strategy rolls out before writing the next log when either the current file is at least ten
+minutes old or already contains 100,000 logs. Time is measured from the first write to each file
+using a monotonic clock; idle periods do not create files. `Duration.ZERO` disables the time limit,
+and `0` disables the count limit. The constructor taking only a `Path` enables manual roll-out only.
+
+`rollOut()` flushes and closes the current file immediately; the next `write()` creates the next
+file. It is safe to call from another thread. Already queued but unwritten logs go into the new file;
+the manual boundary applies to writes, not submissions. Repeated requests without intervening writes
+do not create empty files.
+
+Files are named `monitor.log`, `monitor.1.log`, `monitor.2.log`, and so on. Existing files are skipped
+without overwriting, and missing parent directories are created automatically. Headers in
+comma-separated output do not count toward the limit. Use the same column layout for all logs sent
+to one strategy when using comma-separated output.
+
+`commit()` flushes buffered output and returns `false` on an I/O failure. Write, roll-out, and close
+failures throw `UncheckedIOException`. The strategy implements `AutoCloseable`; `MonitorLogWriter`
+flushes it on shutdown but does not close it, so the caller owns its lifetime.
