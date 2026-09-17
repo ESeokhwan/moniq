@@ -5,19 +5,22 @@ import moniq.IMonitorLog;
 import java.io.BufferedWriter;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 
-public class CsvMonitorLogWriteStrategy implements IMonitorLogWriteStrategy {
+public class CsvMonitorLogWriteStrategy implements IMonitorLogWriteStrategy, AutoCloseable {
 
   private final String filepath;
 
   private BufferedWriter writer;
+  private boolean closed;
 
   public CsvMonitorLogWriteStrategy(String filepath) {
     this.filepath = filepath;
   }
 
   @Override
-  public void write(IMonitorLog log) {
+  public synchronized void write(IMonitorLog log) {
+    ensureOpen();
     if (writer == null) {
       try {
         this.writer = new BufferedWriter(new FileWriter(filepath));
@@ -25,7 +28,7 @@ public class CsvMonitorLogWriteStrategy implements IMonitorLogWriteStrategy {
         writer.append(headerLine)
               .append("\n");
       } catch (IOException e) {
-        e.printStackTrace();
+        throw new UncheckedIOException("Failed to open CSV monitor log " + filepath, e);
       }
     }
     
@@ -34,18 +37,45 @@ public class CsvMonitorLogWriteStrategy implements IMonitorLogWriteStrategy {
       writer.append(curLine)
             .append("\n");
     } catch (IOException e) {
-      e.printStackTrace();
+      throw new UncheckedIOException("Failed to write CSV monitor log " + filepath, e);
     }
   }
 
   @Override
-  public boolean commit() {
+  public synchronized boolean commit() {
+    ensureOpen();
+    if (writer == null) {
+      return true;
+    }
     try {
       this.writer.flush();
     } catch (IOException e) {
-      e.printStackTrace();
+      return false;
     }
     return true;
+  }
+
+  /** Flushes and closes the current CSV file. Repeated calls are harmless. */
+  @Override
+  public synchronized void close() {
+    if (closed) {
+      return;
+    }
+    try {
+      if (writer != null) {
+        writer.close();
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to close CSV monitor log " + filepath, e);
+    } finally {
+      closed = true;
+    }
+  }
+
+  private void ensureOpen() {
+    if (closed) {
+      throw new IllegalStateException("CsvMonitorLogWriteStrategy is closed");
+    }
   }
   
 }

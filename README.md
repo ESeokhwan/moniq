@@ -220,12 +220,36 @@ The included strategies are:
 
 - `CsvMonitorLogWriteStrategy` for CSV files;
 - `FileMonitorLogWriteStrategy` for readable or comma-separated UTF-8 log files with roll-out;
+- `CompositeMonitorLogWriteStrategy` for ordered fan-out to multiple destinations;
 - `ScrapableWriteStrategy` for delimiter-separated output with an optional header;
 - `ReadFriendlyWriteStrategy` for labeled human-readable output;
 - `NoOpWriteStrategy` for measuring monitoring overhead without output.
 
 Custom exporters implement `IMonitorLogWriteStrategy`. `write()` receives preprocessed logs and
-`commit()` is called at flush boundaries.
+`commit()` is called at flush boundaries. Implementations must allow an empty `commit()`; it must
+return `false` when flushing fails.
+
+### Multiple destinations
+
+Use `CompositeMonitorLogWriteStrategy` to send each log to independent destinations in construction
+order. It is fan-out, not a transaction: if a later destination fails during `write()`, earlier
+destinations may already contain that log. Its `commit()` still commits every destination and returns
+`false` when any destination returns `false`.
+
+```java
+FileMonitorLogWriteStrategy file = new FileMonitorLogWriteStrategy(Path.of("logs", "monitor.log"));
+try (CompositeMonitorLogWriteStrategy strategy = new CompositeMonitorLogWriteStrategy(
+    new ReadFriendlyWriteStrategy(System.out), file)) {
+  MonitorLogWriter writer = new MonitorLogWriter(
+      new MonitorQueue(), strategy, BatchPolicy.fixedSize(1_000));
+  // Start, submit to, gracefully shut down, and join writer before closing strategy.
+  // For a manual file boundary: writer.flush(); file.rollOut();
+}
+```
+
+`close()` closes `AutoCloseable` child strategies in reverse order. Keep a reference to a file
+strategy when only that file needs roll-out; roll-out is intentionally not part of the common
+write-strategy interface.
 
 ### Rolling log files
 

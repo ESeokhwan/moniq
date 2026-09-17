@@ -15,6 +15,7 @@ import moniq.IMonitorLog;
 import moniq.MonitorLog;
 import moniq.MonitorQueue;
 import moniq.exception.NotProcessedException;
+import moniq.writer.strategy.CompositeMonitorLogWriteStrategy;
 import moniq.writer.strategy.IMonitorLogWriteStrategy;
 import org.junit.jupiter.api.Test;
 
@@ -339,6 +340,48 @@ class MonitorLogWriterTest {
     assertEquals(failingLog, failedLog.get());
     assertEquals("preprocessing failed", reportedError.get().getMessage());
     assertEquals(List.of("written"), strategy.writtenIds);
+  }
+
+  @Test
+  void commitsPartialCompositeOutputWhenTheErrorHandlerSkipsAWriteFailure() throws Exception {
+    MonitorQueue queue = new MonitorQueue();
+    RecordingWriteStrategy successfulDestination = new RecordingWriteStrategy();
+    IMonitorLogWriteStrategy failingDestination =
+        new IMonitorLogWriteStrategy() {
+          @Override
+          public void write(IMonitorLog log) {
+            throw new IllegalStateException("destination unavailable");
+          }
+
+          @Override
+          public boolean commit() {
+            return true;
+          }
+        };
+    CompositeMonitorLogWriteStrategy strategy =
+        new CompositeMonitorLogWriteStrategy(successfulDestination, failingDestination);
+    CountDownLatch errorReported = new CountDownLatch(1);
+    MonitorLogWriter writer =
+        new MonitorLogWriter(
+            queue,
+            strategy,
+            BatchPolicy.fixedSize(1),
+            FlushPolicy.disabled(),
+            1,
+            (log, error) -> errorReported.countDown());
+    Thread writerThread = new Thread(writer);
+    writerThread.start();
+
+    writer.submit(new MonitorLog("type", "partial", "state", 1L, 10L));
+
+    assertTrue(errorReported.await(2, TimeUnit.SECONDS));
+    assertTrue(successfulDestination.committed.await(2, TimeUnit.SECONDS));
+    writer.gracefulShutdown();
+    writerThread.join(Duration.ofSeconds(2).toMillis());
+
+    assertFalse(writerThread.isAlive());
+    assertEquals(List.of("partial"), successfulDestination.writtenIds);
+    assertEquals(1, successfulDestination.commitCount);
   }
 
   @Test

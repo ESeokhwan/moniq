@@ -59,6 +59,15 @@ class WriteStrategyTest {
   }
 
   @Test
+  void csvStrategyAllowsAnEmptyCommit(@TempDir Path tempDir) {
+    CsvMonitorLogWriteStrategy strategy =
+        new CsvMonitorLogWriteStrategy(tempDir.resolve("monitor.csv").toString());
+
+    assertTrue(strategy.commit());
+    strategy.close();
+  }
+
+  @Test
   void noOpStrategyAcceptsLogs() {
     NoOpWriteStrategy strategy = new NoOpWriteStrategy();
 

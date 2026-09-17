@@ -196,8 +196,8 @@ public class MonitorLogWriter implements Runnable {
    * flush calls are ordered by their queue insertion. If this thread is interrupted while waiting,
    * the flush request remains valid and will still be handled by the writer.
    *
-   * @return the result returned by {@link IMonitorLogWriteStrategy#commit()}, or {@code true} when
-   *     there were no uncommitted writes
+   * @return {@code false} if a commit since the preceding flush boundary failed, or {@code true}
+   *     when all commits succeeded (including when there were no writes)
    * @throws InterruptedException if the calling thread is interrupted while waiting
    * @throws IllegalStateException if shutdown has started, the writer has stopped, or this method
    *     is called by the writer thread
@@ -424,8 +424,8 @@ public class MonitorLogWriter implements Runnable {
         boolean preprocessed = awaitPreprocessing(log, preprocessingResults.get(i));
         if (preprocessed) {
           try {
-            writeStrategy.write(log);
             hasUncommittedWrites = true;
+            writeStrategy.write(log);
           } catch (Throwable error) {
             errorHandler.handle(log, error);
           }
